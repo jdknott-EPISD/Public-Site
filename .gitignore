@@ -1,0 +1,12 @@
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+node_modules/
+*.log
+.env
+.firebase/
+
+# Built app output (made by "npm --prefix app run build" during deploy)
+public/app/
+functions/lib/

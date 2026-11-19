@@ -1,0 +1,285 @@
+rules_version = '2';
+
+// Security rules for the church app's database.
+//
+// Who is who:
+//   - Visitors (not signed in) can read what is published: calendar events, share pages,
+//     published newsletters. They can also answer newsletter polls, RSVPs and forms.
+//   - Members (signed-in accounts, invitation only) manage events, all the newsletters, and
+//     the church share page. Accounts are created only by the acceptInvite Cloud Function.
+//   - Owners are members who can also invite and remove members.
+//
+// Data layout:
+//   members/{uid}                    private profile: name, email, role, accountStatus
+//   spaces/church/newsletters/{id}   the church's newsletters (+ archive, revisions, responses, pollTallies)
+//   spaces/church/settings/{name}    sharePageCustomization (public) and shared editor settings (admins)
+//   publicMembers/{uid}              the name shown on public pages
+//   invites/{token}                  pending invitations; the random token is the secret
+//   events/{id}                      calendar events shown on the home page
+//   newsletterTranslations/{key}     Spanish translations, written only by Cloud Functions
+//   liveStreamDestinations/{id}      where Live Studio streams to (YouTube, Facebook, ...)
+//   liveStreamKeys/{id}              each destination's stream key: write-only, read by Cloud Functions
+//   liveStream/state                 what is on air now, written only by the liveStream function
+//   liveStudio/library               saved scenes, lower thirds, ticker messages, QR codes, YouTube title/privacy
+//   privateYoutube/...               YouTube sign-in (refresh token): Cloud Functions only, closed to browsers
+//   publicLive/status                "we're live" flag the home page reads (public)
+//   liveStudio/control, /monitor     what's on screen now (shared with co-hosts), and a preview picture
+//   liveChat/{id}                    live chat messages from YouTube and Facebook (written by functions)
+//   liveStudioAssets/{id}            uploaded logos, overlays, backgrounds (as data: URLs), video clips (file in Storage)
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function memberDoc() {
+      return get(/databases/$(database)/documents/members/$(request.auth.uid));
+    }
+
+    // An active church member (a removed member keeps their doc with accountStatus 'removed')
+    function isMember() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/members/$(request.auth.uid))
+        && memberDoc().data.get('accountStatus', 'active') == 'active';
+    }
+
+    function isChurchOwner() {
+      return isMember() && memberDoc().data.get('role', 'admin') == 'owner';
+    }
+
+    // An active member working in the church's shared space
+    function isChurchAdmin(spaceId) {
+      return isMember() && spaceId == 'church';
+    }
+
+    function isSelf(memberId) {
+      return isMember() && request.auth.uid == memberId;
+    }
+
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    // ---------- Members ----------
+    match /members/{memberId} {
+      allow read: if isMember();
+      // Created only by the acceptInvite function
+      allow create: if false;
+      // Members edit their own profile, but never their own role, status or email.
+      // Owners can change anyone's role or remove them (accountStatus 'removed').
+      allow update: if (isSelf(memberId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'accountStatus', 'email', 'uid']))
+                    || (isChurchOwner() && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['email', 'uid']));
+      allow delete: if false;
+    }
+
+    // ---------- The church's shared newsletters and share page ----------
+    // Every active member (admin) can edit all of them; spaceId is always 'church'.
+    match /spaces/{spaceId} {
+      match /settings/{settingId} {
+        // The share page's look is public; shared editor settings (card library, brand presets,
+        // form-response archive state) are for admins only
+        allow read: if settingId == 'sharePageCustomization' || isChurchAdmin(spaceId);
+        allow write: if isChurchAdmin(spaceId);
+      }
+
+      match /newsletters/{newsletterId} {
+        allow read: if true;
+        // Visitors may only bump the view counter
+        allow update: if isChurchAdmin(spaceId) || onlyChanges(['viewCount']);
+        allow create: if isChurchAdmin(spaceId);
+        // "primary" is the church's first newsletter; its link is shared publicly, so it can be retired but not deleted
+        allow delete: if isChurchAdmin(spaceId) && newsletterId != 'primary';
+
+        match /archive/{archiveId} {
+          allow read: if true;
+          allow update: if isChurchAdmin(spaceId) || onlyChanges(['viewCount']);
+          allow create, delete: if isChurchAdmin(spaceId);
+        }
+
+        // Autosave history
+        match /revisions/{revId} {
+          allow read, write: if isChurchAdmin(spaceId);
+        }
+
+        // Written only by the onNewsletterPollVote function
+        match /pollTallies/{sectionId} {
+          allow read: if true;
+          allow write: if false;
+        }
+
+        // Visitors' poll votes, event RSVPs and form answers
+        match /responses/{responseId} {
+          allow create: if (
+                           // Single-choice poll
+                           request.resource.data.keys().hasOnly(['sectionId', 'option', 'submittedAt']) &&
+                           request.resource.data.sectionId is string &&
+                           request.resource.data.option is string &&
+                           request.resource.data.option.size() <= 200
+                         ) || (
+                           // Event RSVP
+                           request.resource.data.keys().hasOnly(['sectionId', 'option', 'name', 'guests', 'submittedAt']) &&
+                           request.resource.data.sectionId is string &&
+                           request.resource.data.option in ['Going', 'Maybe', 'Not going'] &&
+                           request.resource.data.name is string &&
+                           request.resource.data.name.size() > 0 &&
+                           request.resource.data.name.size() <= 100 &&
+                           request.resource.data.guests is int &&
+                           request.resource.data.guests >= 0 &&
+                           request.resource.data.guests <= 20
+                         ) || (
+                           // Multi-field form
+                           request.resource.data.keys().hasOnly(['formId', 'answers', 'submittedAt']) &&
+                           request.resource.data.formId is string &&
+                           request.resource.data.answers is map &&
+                           request.resource.data.answers.size() <= 50
+                         );
+          allow read, update, delete: if isChurchAdmin(spaceId);
+        }
+      }
+    }
+
+    // ---------- Public names ----------
+    match /publicMembers/{memberId} {
+      allow read: if true;
+      allow create, update: if isSelf(memberId)
+                            && request.resource.data.keys().hasOnly(['name', 'updatedAt'])
+                            && request.resource.data.name is string
+                            && request.resource.data.name.size() <= 100;
+      allow delete: if false;
+    }
+
+    // ---------- Invitations ----------
+    match /invites/{inviteToken} {
+      // Opening an invite link reads it by its token; only owners can list them
+      allow get: if true;
+      allow list: if isChurchOwner();
+      allow create: if isChurchOwner()
+                    && request.resource.data.keys().hasOnly(['email', 'name', 'role', 'invitedBy', 'invitedByName', 'createdAt', 'expiresAt'])
+                    && request.resource.data.email is string
+                    && request.resource.data.name is string
+                    && request.resource.data.role in ['admin', 'owner']
+                    && request.resource.data.invitedBy == request.auth.uid;
+      // Deleted by owners (cancel) or by the acceptInvite function once used
+      allow delete: if isChurchOwner();
+      allow update: if false;
+    }
+
+    // ---------- Calendar events ----------
+    match /events/{eventId} {
+      allow read: if true;
+      allow create, update: if isMember()
+                            && request.resource.data.date is string
+                            && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+                            && request.resource.data.type in ['church', 'holiday']
+                            && request.resource.data.en is string
+                            && request.resource.data.en.size() > 0
+                            && request.resource.data.en.size() <= 120
+                            && request.resource.data.es is string
+                            && request.resource.data.es.size() <= 120
+                            && request.resource.data.get('time', '') is string
+                            && request.resource.data.get('time', '').size() <= 80
+                            && request.resource.data.get('place', '') is string
+                            && request.resource.data.get('place', '').size() <= 120;
+      allow delete: if isMember();
+    }
+
+    // ---------- Cached translations ----------
+    match /newsletterTranslations/{translationId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ---------- Live Studio ----------
+    match /liveStreamDestinations/{destinationId} {
+      allow read, delete: if isMember();
+      allow create, update: if isMember()
+                            && request.resource.data.keys().hasOnly(['name', 'platform', 'serverUrl', 'keyHint', 'createdAt', 'updatedAt', 'updatedBy'])
+                            && request.resource.data.name is string
+                            && request.resource.data.name.size() > 0
+                            && request.resource.data.name.size() <= 60
+                            && request.resource.data.platform in ['youtube', 'facebook', 'twitch', 'custom']
+                            && request.resource.data.serverUrl is string
+                            && request.resource.data.serverUrl.matches('^rtmps?://.{3,300}$')
+                            && request.resource.data.get('keyHint', '') is string
+                            && request.resource.data.get('keyHint', '').size() <= 8;
+    }
+
+    // Stream keys are secrets: members can set or replace one, but no browser can read it back
+    match /liveStreamKeys/{destinationId} {
+      allow read: if false;
+      allow create, update: if isMember()
+                            && request.resource.data.keys().hasOnly(['key', 'updatedAt'])
+                            && request.resource.data.key is string
+                            && request.resource.data.key.size() > 0
+                            && request.resource.data.key.size() <= 500;
+      allow delete: if isMember();
+    }
+
+    match /liveStream/{docId} {
+      allow read: if isMember();
+      allow write: if false;
+    }
+
+    // library: saved scenes and captions. control: what's on screen now, shared so a co-host on
+    // another computer can switch scenes and captions. monitor: a small picture of what's on
+    // air, posted every few seconds by the streaming computer for co-hosts.
+    // Public "we're live" flag for the home page; written only by the liveStream function
+    match /publicLive/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /liveStudio/{docId} {
+      allow read: if isMember();
+      allow write: if isMember() && (
+                     (docId == 'library'
+                       && request.resource.data.keys().hasOnly(['scenes', 'lowerThirds', 'tickers', 'qrCodes', 'stream', 'updatedAt'])
+                       && (!('stream' in request.resource.data) || (request.resource.data.stream is map
+                           && request.resource.data.stream.keys().hasOnly(['title', 'privacy', 'description'])
+                           && request.resource.data.stream.get('title', '') is string && request.resource.data.stream.get('title', '').size() <= 100
+                           && request.resource.data.stream.get('description', '') is string && request.resource.data.stream.get('description', '').size() <= 4900
+                           && request.resource.data.stream.get('privacy', 'public') in ['public', 'unlisted', 'private']))
+                       && request.resource.data.get('scenes', []).size() <= 30
+                       && request.resource.data.get('lowerThirds', []).size() <= 100
+                       && request.resource.data.get('tickers', []).size() <= 50
+                       && request.resource.data.get('qrCodes', []).size() <= 30)
+                     || (docId == 'control'
+                       && request.resource.data.keys().hasOnly(['sceneId', 'sceneEndsAt', 'layout', 'swap', 'clip', 'tickerSpeed', 'chatShown', 'cameraRadius', 'screenRadius', 'cameraShape', 'placement', 'logo', 'overlay', 'background', 'lowerThird', 'ticker', 'qr', 'updatedAt', 'updatedBy']))
+                     || (docId == 'monitor'
+                       && request.resource.data.keys().hasOnly(['image', 'sharing', 'cameraOn', 'micMuted', 'helper', 'live', 'updatedAt', 'updatedBy'])
+                       && request.resource.data.image is string
+                       && request.resource.data.image.size() < 300000)
+                   );
+    }
+
+    // YouTube live chat and Facebook comments during a stream; written only by Cloud Functions
+    match /liveChat/{messageId} {
+      allow read: if isMember();
+      allow write: if false;
+    }
+
+    match /liveStudioAssets/{assetId} {
+      allow read, delete: if isMember();
+      allow create, update: if isMember()
+                            && request.resource.data.keys().hasOnly(['kind', 'name', 'dataUrl', 'createdAt', 'storagePath', 'size', 'duration'])
+                            && request.resource.data.kind in ['logo', 'overlay', 'background', 'video']
+                            // A video clip lives in Storage (liveStudioVideos/); dataUrl is its thumbnail
+                            && (request.resource.data.kind != 'video' || (
+                                 request.resource.data.storagePath is string
+                                 && request.resource.data.storagePath.matches('^liveStudioVideos/[A-Za-z0-9_-]+[.](mp4|mov|m4v|webm)$')
+                                 && request.resource.data.size is number
+                                 && request.resource.data.duration is number))
+                            && request.resource.data.name is string
+                            && request.resource.data.name.size() <= 80
+                            && request.resource.data.dataUrl is string
+                            && request.resource.data.dataUrl.matches('^data:image/(png|jpeg);base64,.*')
+                            && request.resource.data.dataUrl.size() < 1000000;
+    }
+
+    // Everything else is closed
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

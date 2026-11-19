@@ -1,0 +1,56 @@
+rules_version = '2';
+
+// Security rules for uploaded files (newsletter images and share-page pictures).
+// Anyone can view them, because they appear on public pages. Only active church members can upload.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isMember() {
+      return request.auth != null
+        && firestore.exists(/databases/(default)/documents/members/$(request.auth.uid))
+        && firestore.get(/databases/(default)/documents/members/$(request.auth.uid)).data.get('accountStatus', 'active') == 'active';
+    }
+
+    function isImageUnder(maxBytes) {
+      return request.resource == null
+        || (request.resource.contentType.matches('image/.*') && request.resource.size < maxBytes);
+    }
+
+    // Newsletter images (backgrounds, headers, content, galleries, carousels)
+    match /newsletter/{allPaths=**} {
+      allow read: if true;
+      allow write: if isMember() && isImageUnder(5 * 1024 * 1024);
+    }
+
+    // Share page pictures: the church's share page (stored as 'church'); any member can change them
+    match /sharePageAvatars/{spaceId} {
+      allow read: if true;
+      allow write: if isMember() && spaceId == 'church' && isImageUnder(5 * 1024 * 1024);
+    }
+
+    match /homeScreenIcons/{spaceId} {
+      allow read: if true;
+      allow write: if isMember() && spaceId == 'church' && isImageUnder(2 * 1024 * 1024);
+    }
+
+    match /sharePageBackgrounds/{spaceId} {
+      allow read: if true;
+      allow write: if isMember() && spaceId == 'church' && isImageUnder(5 * 1024 * 1024);
+    }
+
+    // Live Studio video clips (intros, outros). Only members can see them: the studio downloads
+    // them through the liveStudioVideo Cloud Function, so they never need to be public.
+    match /liveStudioVideos/{fileName} {
+      allow read: if isMember();
+      allow write: if isMember()
+                   && fileName.matches('^[A-Za-z0-9_-]+[.](mp4|mov|m4v|webm)$')
+                   && (request.resource == null
+                       || (request.resource.contentType.matches('video/.*') && request.resource.size < 300 * 1024 * 1024));
+    }
+
+    // Everything else is closed
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
