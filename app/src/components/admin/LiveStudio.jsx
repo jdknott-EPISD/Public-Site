@@ -550,6 +550,7 @@ const LiveStudio = () => {
       layout: control.layout,
       second: control.second || 'screen',
       cameraSource: control.cameraSource || 'webcam',
+      trioTurn: control.trioTurn || 0,
       swap: !!control.swap,
       mirrorCamera,
       tickerSpeed: control.tickerSpeed || 110,
@@ -1290,12 +1291,21 @@ const LiveStudio = () => {
                     </button>
                   );
                 })}
+                {control.layout === 'trio' && threeAvailable ? (
+                <button onClick={() => updateControl({ trioTurn: ((control.trioTurn || 0) + 1) % 3 })}
+                  title="Turn the three pictures clockwise: each one moves to the next box (large, top right, bottom right)"
+                  aria-label="Rotate the three pictures clockwise"
+                  className="px-3 rounded-lg bg-white/5 hover:bg-white/10 transition text-sm font-medium flex items-center gap-1.5">
+                  <Icon d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" className="w-5 h-5" /> Rotate
+                </button>
+                ) : (
                 <button onClick={() => updateControl({ swap: !control.swap })} disabled={!swapAvailable}
                   title={swapAvailable ? `Swap the camera and the ${boxName} (or drag one onto the other in the preview)` : 'Choose a layout with two boxes to swap them'}
                   aria-label={`Swap camera and ${boxName}`} aria-pressed={!!control.swap}
                   className={`px-3 rounded-lg bg-white/5 transition text-sm font-medium flex items-center gap-1.5 disabled:opacity-30 disabled:cursor-not-allowed ${control.swap ? 'ring-2 ring-church-blue' : 'hover:bg-white/10'}`}>
                   <Icon d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" className="w-5 h-5" /> Swap
                 </button>
+                )}
                 <button onClick={() => setShowStyle(true)} title="Camera shape and rounded corners" aria-label="Box style"
                   className="px-3 rounded-lg bg-white/5 hover:bg-white/10 transition text-sm font-medium flex items-center gap-1.5">
                   <Icon d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" className="w-5 h-5" /> Style

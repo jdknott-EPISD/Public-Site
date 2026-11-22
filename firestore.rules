@@ -245,7 +245,7 @@ service cloud.firestore {
                        && request.resource.data.get('tickers', []).size() <= 50
                        && request.resource.data.get('qrCodes', []).size() <= 30)
                      || (docId == 'control'
-                       && request.resource.data.keys().hasOnly(['sceneId', 'sceneEndsAt', 'layout', 'second', 'cameraSource', 'swap', 'clip', 'tickerSpeed', 'chatShown', 'cameraRadius', 'screenRadius', 'cameraShape', 'placement', 'logo', 'overlay', 'background', 'lowerThird', 'ticker', 'qr', 'updatedAt', 'updatedBy']))
+                       && request.resource.data.keys().hasOnly(['sceneId', 'sceneEndsAt', 'layout', 'second', 'cameraSource', 'trioTurn', 'swap', 'clip', 'tickerSpeed', 'chatShown', 'cameraRadius', 'screenRadius', 'cameraShape', 'placement', 'logo', 'overlay', 'background', 'lowerThird', 'ticker', 'qr', 'updatedAt', 'updatedBy']))
                      || (docId == 'monitor'
                        && request.resource.data.keys().hasOnly(['image', 'sharing', 'phone', 'cameraOn', 'micMuted', 'helper', 'live', 'updatedAt', 'updatedBy'])
                        && request.resource.data.image is string

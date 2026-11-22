@@ -230,6 +230,7 @@ export class StudioMixer {
       overlay: null,            // Image (full frame, usually a transparent PNG)
       second: 'screen',         // what fills the screen's box: 'screen' or 'phone' (falls back to whichever is on)
       cameraSource: 'webcam',   // what fills the camera's box while a screen is shared: 'webcam' or 'phone'
+      trioTurn: 0,              // trio layout: how many times the three pictures were turned clockwise
       lowerThird: null,         // { title, subtitle, style, frame } (see lowerThirds.js)
       ticker: null,             // { text, startedAt }
       qr: null                  // { image, label }
@@ -543,7 +544,8 @@ export class StudioMixer {
     };
 
     if (layout === 'trio') {
-      // The shared screen large; the webcam and the phone stacked beside it
+      // One large box with two stacked beside it. Starts as screen large, webcam top, phone
+      // bottom; each turn moves every picture one place clockwise (large -> top -> bottom -> large).
       const sw = Math.round(WIDTH * 0.3);
       const sh = Math.round(sw * 9 / 16);
       const bigW = WIDTH - sw - pad * 3;
@@ -552,12 +554,16 @@ export class StudioMixer {
       const sideX = pad * 2 + bigW;
       const stackY = (HEIGHT - bottom - (sh * 2 + pad)) / 2;
       const radius = (v) => (Number.isFinite(Number(v)) ? Number(v) : 12);
-      this.drawVideoBox(sharedScreen, pad, bigY, bigW, bigH, 'contain', radius(this.state.screenRadius));
-      this.slots.push({ source: 'screen', x: pad, y: bigY, w: bigW, h: bigH });
-      [webcam, phone].forEach((video, i) => {
-        const y = stackY + i * (sh + pad);
-        this.drawVideoBox(video, sideX, y, sw, sh, video === phone && phone.videoWidth < phone.videoHeight ? 'contain' : 'cover', radius(this.state.cameraRadius));
-        this.slots.push({ source: i === 0 ? 'camera' : 'phone', x: sideX, y, w: sw, h: sh });
+      const turn = ((Math.round(Number(this.state.trioTurn) || 0) % 3) + 3) % 3;
+      const base = [sharedScreen, webcam, phone];
+      const order = [0, 1, 2].map((i) => base[(i - turn + 3) % 3]);
+      const boxes = [[pad, bigY, bigW, bigH], [sideX, stackY, sw, sh], [sideX, stackY + sh + pad, sw, sh]];
+      const nameOf = (v) => (v === sharedScreen ? 'screen' : v === webcam ? 'camera' : 'phone');
+      order.forEach((video, i) => {
+        const [x, y, w, h] = boxes[i];
+        const fit = video === sharedScreen || (video === phone && phone.videoWidth < phone.videoHeight) ? 'contain' : 'cover';
+        this.drawVideoBox(video, x, y, w, h, fit, radius(video === sharedScreen ? this.state.screenRadius : this.state.cameraRadius));
+        this.slots.push({ source: nameOf(video), x, y, w, h });
       });
       return;
     }
