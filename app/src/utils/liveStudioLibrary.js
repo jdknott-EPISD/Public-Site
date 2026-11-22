@@ -111,6 +111,9 @@ export const DEFAULT_CONTROL = {
   sceneEndsAt: 0,
   layout: 'camera',
   swap: false,
+  second: 'screen', // what fills the screen's box: 'screen' or 'phone' (phone camera)
+  cameraSource: 'webcam', // what fills the camera's box while a screen is shared: 'webcam' or 'phone'
+  trioTurn: 0, // screen/webcam/phone layout: how many times the pictures were turned clockwise
   clip: null, // { id, startedAt, sceneId? } while a video clip plays (sceneId: started by a Media scene)
   tickerSpeed: 110, // pixels per second
   chatShown: null, // { id, author, text, platform }: a chat message on screen
