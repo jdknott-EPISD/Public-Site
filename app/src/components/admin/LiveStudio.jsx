@@ -19,6 +19,7 @@ import { StudioMixer, LAYOUTS, WIDTH, HEIGHT, loadImage } from '../../utils/live
 import { addVideo, isGifAsset, isVideoAsset, loadClip, newId, postMonitor, useStudioControl, useStudioLibrary, useStudioMonitor } from '../../utils/liveStudioLibrary';
 import { HelperStream, INSTALL_COMMAND, getHelperStatus } from '../../utils/streamHelper';
 import { usePhoneCamera } from '../../utils/phoneCamera';
+import { LocalRecorder, canPickFile, canRecord, formatBytes, pickRecordingFile, recordingName } from '../../utils/localRecorder';
 import PhoneCameraModal from '../live/PhoneCameraModal';
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, rectSortingStrategy, useSortable } from '@dnd-kit/sortable';
@@ -381,6 +382,80 @@ const StyleModal = ({ shape, cameraRadius, screenRadius, layout, placement, onCh
 // Layouts with a camera box and a screen box that can trade places
 const TWO_BOX = ['pip', 'cameraPip', 'side', 'split', 'splitTall'];
 
+// GO LIVE asks first: which channels, and whether to save a recording on this computer.
+// With no channels ticked it only records (handy before YouTube or Facebook are set up).
+const RECORD_KEY = 'studioRecordLocal';
+const GoLiveModal = ({ channels, title, onStart, onClose, onChannels }) => {
+  const recordable = canRecord();
+  const [record, setRecord] = useState(() => {
+    if (!recordable) return false;
+    if (channels.length === 0) return true;
+    try { return localStorage.getItem(RECORD_KEY) === '1'; } catch { return false; }
+  });
+  const [handle, setHandle] = useState(null);
+  const [error, setError] = useState('');
+  const recordOnly = channels.length === 0;
+
+  const choose = async () => {
+    setError('');
+    try { setHandle(await pickRecordingFile(recordingName(title))); } catch (e) { if (e?.name !== 'AbortError') setError('Could not choose that place. Try another folder.'); }
+  };
+
+  const start = async () => {
+    setError('');
+    if (recordOnly && !record) { setError('Tick a channel in Channels, or turn on the recording.'); return; }
+    let file = handle;
+    if (record && !file && canPickFile()) {
+      // Still a click, so the save window may open now
+      try { file = await pickRecordingFile(recordingName(title)); } catch (e) { if (e?.name !== 'AbortError') setError('Could not choose that place.'); return; }
+    }
+    try { localStorage.setItem(RECORD_KEY, record ? '1' : '0'); } catch { /* this visit only */ }
+    onStart({ record, handle: file });
+  };
+
+  return (
+    <Modal title={recordOnly ? 'Record' : 'Go live'} onClose={onClose} onSubmit={start}
+      submitLabel={recordOnly ? 'Start recording' : record ? 'GO LIVE and record' : 'GO LIVE'} error={error}>
+      {recordOnly ? (
+        <p className="text-sm text-white/70">
+          No channels are ticked, so this only records on this computer.{' '}
+          <button type="button" onClick={onChannels} className="underline text-white/90">Choose channels</button> to stream too.
+        </p>
+      ) : (
+        <p className="text-sm text-white/70">Streaming to <strong className="text-white">{channels.map((c) => c.name).join(', ')}</strong>.</p>
+      )}
+      {recordable ? (
+        <div className="space-y-3 rounded-lg bg-white/5 p-3">
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input type="checkbox" checked={record} onChange={(e) => setRecord(e.target.checked)} />
+            Save a recording on this computer
+          </label>
+          {record && (
+            canPickFile() ? (
+              <div className="flex items-center gap-2">
+                <button type="button" onClick={choose} className="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-sm font-medium flex-shrink-0">
+                  {handle ? 'Change…' : 'Choose where to save…'}
+                </button>
+                <span className="text-xs text-white/60 truncate">{handle ? handle.name : 'You\'ll pick the folder and name when you start.'}</span>
+              </div>
+            ) : (
+              <p className="text-xs text-white/60">The recording downloads when you stop.</p>
+            )
+          )}
+          {record && (
+            <p className="text-xs text-white/50">
+              Records exactly what viewers see and hear, as a video file (MP4 in Chrome), about 2.7 GB an hour.
+              Keep this tab open: if the browser closes unexpectedly, the recording is lost. It keeps recording if the stream drops.
+            </p>
+          )}
+        </div>
+      ) : (
+        <p className="text-xs text-white/50">This browser can&apos;t record. Use Chrome to save a recording.</p>
+      )}
+    </Modal>
+  );
+};
+
 const LayoutIcon = ({ boxes }) => (
   <span className="relative block w-14 h-8">
     {boxes.map(([x, y, w, h], i) => (
@@ -461,6 +536,11 @@ const LiveStudio = () => {
   const [sendingHere, setSendingHere] = useState(false);
   const [broadcast, setBroadcast] = useState(null);
   const [notice, setNotice] = useState('');
+  const [showGoLive, setShowGoLive] = useState(false);
+  // Local recording (streaming computer only): { name, startedAt, bytes } while recording
+  const recorderRef = useRef(null);
+  const [recording, setRecording] = useState(null);
+  const [savedNote, setSavedNote] = useState('');
   const [now, setNow] = useState(Date.now());
 
   const canShareScreen = typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia;
@@ -942,6 +1022,7 @@ const LiveStudio = () => {
   };
 
   // ----- Broadcast -----
+  const stopRecordingRef = useRef(null);
   const endHere = useCallback((message) => {
     const out = outRef.current;
     outRef.current = null;
@@ -957,6 +1038,7 @@ const LiveStudio = () => {
       setBroadcast(data.status === 'live' ? data : null);
       if (data.status !== 'live' && outRef.current) {
         endHere(data.endedByName ? `${data.endedByName} ended the stream.` : 'The stream ended.');
+        stopRecordingRef.current?.();
       }
       setPhase((p) => (p === 'starting' || p === 'stopping' ? p : data.status === 'live' ? 'live' : 'idle'));
     } catch (error) {
@@ -986,7 +1068,7 @@ const LiveStudio = () => {
   // Only a status checked after this stream started counts: an older one says "not live".
   useEffect(() => {
     if (sendingHere && helper && !helper.live && helper.checkedAt > sendStartedAtRef.current) {
-      endHere(helper.lastError || 'The stream stopped.');
+      endHere(`${helper.lastError || 'The stream stopped.'}${recorderRef.current ? ' The recording on this computer is still going: click Stop recording when you\'re done.' : ''}`);
       callLiveStream({ action: 'stop' }).catch(() => {});
       setBroadcast(null);
       setPhase('idle');
@@ -994,12 +1076,70 @@ const LiveStudio = () => {
   }, [sendingHere, helper, endHere]);
 
   // Warn before closing the tab while sending (closing it ends the stream)
+  // (and while recording: closing it loses the recording)
   useEffect(() => {
-    if (!sendingHere) return undefined;
+    if (!sendingHere && !recording) return undefined;
     const warn = (e) => { e.preventDefault(); e.returnValue = ''; };
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
-  }, [sendingHere]);
+  }, [sendingHere, recording]);
+
+  // ----- Local recording -----
+  const stopRecording = useCallback(async () => {
+    const rec = recorderRef.current;
+    if (!rec) return;
+    recorderRef.current = null;
+    setRecording((r) => (r ? { ...r, finishing: true } : r));
+    const { name, bytes } = await rec.stop();
+    setRecording(null);
+    setSavedNote(`Recording saved: ${name} (${formatBytes(bytes)}).`);
+  }, []);
+
+  stopRecordingRef.current = stopRecording;
+
+  const startRecording = async (handle) => {
+    const name = handle?.name || recordingName(library?.stream?.title);
+    const rec = new LocalRecorder(mixer.videoTrack, mixer.audioTrack, handle, name);
+    rec.onError = (message) => { setNotice(message); stopRecording(); };
+    await rec.start();
+    recorderRef.current = rec;
+    setSavedNote('');
+    setRecording({ name: rec.fileName, startedAt: rec.startedAt, bytes: 0 });
+  };
+
+  // Size and time, once a second
+  useEffect(() => {
+    if (!recording || recording.finishing) return;
+    const rec = recorderRef.current;
+    if (rec && rec.bytes !== recording.bytes) setRecording((r) => (r ? { ...r, bytes: rec.bytes } : r));
+  }, [now, recording]);
+
+  // Stop recording if the studio closes inside the app
+  useEffect(() => () => { recorderRef.current?.stop(); }, []);
+
+  const selectedChannels = (destinations || []).filter((d) => selected.has(d.id));
+
+  // GO LIVE (and Record): asks first, in GoLiveModal
+  const openGoLive = () => {
+    if (!mixer || !streamer) return;
+    mixer.resumeAudio();
+    setNotice('');
+    setShowGoLive(true);
+  };
+
+  const startFromModal = async ({ record, handle }) => {
+    setShowGoLive(false);
+    if (record) {
+      try {
+        await startRecording(handle);
+      } catch (error) {
+        console.error('Recording failed to start:', error);
+        setNotice(`The recording couldn't start: ${error.message || error}`);
+        if (selectedChannels.length === 0) return;
+      }
+    }
+    if (selectedChannels.length > 0) await goLive();
+  };
 
   const goLive = async () => {
     if (!mixer || !streamer) return;
@@ -1050,9 +1190,10 @@ const LiveStudio = () => {
   };
 
   const endStream = async () => {
-    if (!window.confirm('End the stream for everyone watching?')) return;
+    if (!window.confirm(recording ? 'End the stream for everyone watching, and stop the recording?' : 'End the stream for everyone watching?')) return;
     setPhase('stopping');
     endHere();
+    stopRecording();
     try {
       await callLiveStream({ action: 'stop' });
     } catch (error) {
@@ -1064,7 +1205,8 @@ const LiveStudio = () => {
   };
 
   const leave = () => {
-    if (sendingHere && !window.confirm('Leaving the studio ends the stream. Leave anyway?')) return;
+    if ((sendingHere || recording) && !window.confirm(`Leaving the studio ends the ${sendingHere ? 'stream' : 'recording'}${sendingHere && recording ? ' and the recording' : ''}. Leave anyway?`)) return;
+    if (recorderRef.current) stopRecording();
     navigate('/admin/dashboard');
   };
 
@@ -1143,10 +1285,21 @@ const LiveStudio = () => {
               <span className="w-2 h-2 rounded-full bg-white animate-pulse" /> LIVE {elapsed}
             </span>
           )}
+          {recording && (
+            <span className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/10 text-sm font-semibold" title={`Recording to ${recording.name}`}>
+              <span className={`w-2.5 h-2.5 rounded-full bg-red-500 ${recording.finishing ? '' : 'animate-pulse'}`} />
+              {recording.finishing ? 'Saving…' : <>REC {formatElapsed(now - recording.startedAt)} <span className="font-normal text-white/60">{formatBytes(recording.bytes)}</span></>}
+            </span>
+          )}
           {phase === 'live' ? (
             <button onClick={endStream} disabled={busy} className="px-5 py-2.5 rounded-full bg-white text-[#18181b] font-semibold hover:bg-white/90 disabled:opacity-60 transition">End stream</button>
+          ) : streamer && recording ? (
+            <button onClick={() => { if (window.confirm('Stop the recording?')) stopRecording(); }} disabled={!!recording.finishing}
+              className="px-5 py-2.5 rounded-full bg-white text-[#18181b] font-semibold hover:bg-white/90 disabled:opacity-60 transition">
+              Stop recording
+            </button>
           ) : streamer ? (
-            <button onClick={goLive} disabled={busy}
+            <button onClick={openGoLive} disabled={busy}
               className="px-6 py-2.5 rounded-full bg-church-red hover:bg-church-red-dark disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold tracking-wide transition">
               {phase === 'starting' ? 'Starting…' : phase === 'stopping' ? 'Ending…' : 'GO LIVE'}
             </button>
@@ -1156,7 +1309,7 @@ const LiveStudio = () => {
         </div>
       </header>
 
-      {(helperMissing || helperOld || helper?.warning || liveElsewhere || notice || !streamer) && (
+      {(helperMissing || helperOld || helper?.warning || liveElsewhere || notice || savedNote || !streamer) && (
         <div className="px-3 sm:px-5 pt-3 space-y-2">
           {helperMissing && (
             <div className="p-3 rounded-lg bg-church-gold/15 border border-church-gold/40 text-sm flex flex-wrap items-center justify-between gap-3">
@@ -1182,6 +1335,12 @@ const LiveStudio = () => {
           {liveElsewhere && streamer && (
             <div className="p-3 rounded-lg bg-church-blue/15 border border-church-blue/40 text-sm">
               The church is live from another computer{broadcast?.startedByName ? ` (started by ${broadcast.startedByName})` : ''}. Switch to <strong>Co-host</strong> above to help run it from here.
+            </div>
+          )}
+          {savedNote && (
+            <div className="p-3 rounded-lg bg-green-500/15 border border-green-400/40 text-sm flex justify-between gap-4">
+              <span>{savedNote}</span>
+              <button onClick={() => setSavedNote('')} aria-label="Dismiss"><Icon d={ICONS.close} className="w-4 h-4" /></button>
             </div>
           )}
           {notice && (
@@ -1450,6 +1609,10 @@ const LiveStudio = () => {
 
       {editingScene && (
         <SceneForm scene={editingScene} scenes={scenes} backgrounds={backgrounds} videos={videos} onSave={saveScene} onDelete={() => deleteScene(editingScene)} onClose={() => setEditingScene(null)} />
+      )}
+      {showGoLive && streamer && (
+        <GoLiveModal channels={selectedChannels} title={library?.stream?.title} onStart={startFromModal}
+          onClose={() => setShowGoLive(false)} onChannels={() => { setShowGoLive(false); setPanel('channels'); }} />
       )}
       {showPhone && streamer && <PhoneCameraModal phone={phone} onClose={() => setShowPhone(false)} />}
       {showStyle && (
