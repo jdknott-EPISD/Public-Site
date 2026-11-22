@@ -1160,6 +1160,34 @@ const LiveStudio = () => {
   const selectedChannels = (destinations || []).filter((d) => selected.has(d.id));
 
   // GO LIVE (and Record): asks first, in GoLiveModal
+  // ● Record: start recording now, straight to Desktop/Live (asks for the Desktop the first time)
+  const savedFolderRef = useRef(null);
+  useEffect(() => { if (streamer && canUseFolder()) getSavedFolder().then((f) => { savedFolderRef.current = f; }); }, [streamer]);
+  const quickRecord = async () => {
+    if (!mixer || !streamer || recorderRef.current) return;
+    mixer.resumeAudio();
+    setNotice('');
+    const name = recordingName(library?.stream?.title);
+    let file = null;
+    let where = '';
+    try {
+      if (canUseFolder()) {
+        let f = savedFolderRef.current;
+        if (!f || !(await folderAllowed(f.handle))) f = await chooseRecordingsFolder();
+        savedFolderRef.current = f;
+        file = await createRecordingFile(f.handle, name);
+        where = f.label;
+      } else if (canPickFile()) {
+        file = await pickRecordingFile(name);
+      }
+      await startRecording(file, where);
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+      console.error('Recording failed to start:', error);
+      setNotice(`The recording couldn't start: ${error.message || error}`);
+    }
+  };
+
   const openGoLive = () => {
     if (!mixer || !streamer) return;
     mixer.resumeAudio();
@@ -1329,7 +1357,20 @@ const LiveStudio = () => {
             <span className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/10 text-sm font-semibold" title={`Recording to ${recording.name}`}>
               <span className={`w-2.5 h-2.5 rounded-full bg-red-500 ${recording.finishing ? '' : 'animate-pulse'}`} />
               {recording.finishing ? 'Saving…' : <>REC {formatElapsed(now - recording.startedAt)} <span className="font-normal text-white/60">{formatBytes(recording.bytes)}</span></>}
+              {phase === 'live' && !recording.finishing && (
+                <button onClick={() => { if (window.confirm('Stop the recording? The stream keeps going.')) stopRecording(); }}
+                  className="ml-1 w-5 h-5 rounded bg-white/15 hover:bg-white/25 flex items-center justify-center" aria-label="Stop recording" title="Stop recording (the stream keeps going)">
+                  <span className="w-2 h-2 bg-white" />
+                </button>
+              )}
             </span>
+          )}
+          {streamer && !recording && canRecord() && (
+            <button onClick={quickRecord} disabled={busy}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-50 text-white font-semibold transition"
+              title="Record to Desktop/Live on this computer (works with or without going live)">
+              <span className="w-2.5 h-2.5 rounded-full bg-red-500" /> Record
+            </button>
           )}
           {phase === 'live' ? (
             <button onClick={endStream} disabled={busy} className="px-5 py-2.5 rounded-full bg-white text-[#18181b] font-semibold hover:bg-white/90 disabled:opacity-60 transition">End stream</button>
