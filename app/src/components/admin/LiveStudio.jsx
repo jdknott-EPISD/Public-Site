@@ -19,7 +19,7 @@ import { StudioMixer, LAYOUTS, WIDTH, HEIGHT, loadImage } from '../../utils/live
 import { addVideo, isGifAsset, isVideoAsset, loadClip, newId, postMonitor, useStudioControl, useStudioLibrary, useStudioMonitor } from '../../utils/liveStudioLibrary';
 import { HelperStream, INSTALL_COMMAND, getHelperStatus } from '../../utils/streamHelper';
 import { usePhoneCamera } from '../../utils/phoneCamera';
-import { LocalRecorder, canPickFile, canRecord, formatBytes, pickRecordingFile, recordingName } from '../../utils/localRecorder';
+import { LocalRecorder, canPickFile, canRecord, canUseFolder, chooseRecordingsFolder, createRecordingFile, folderAllowed, formatBytes, getSavedFolder, pickRecordingFile, recordingName } from '../../utils/localRecorder';
 import PhoneCameraModal from '../live/PhoneCameraModal';
 import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, rectSortingStrategy, useSortable } from '@dnd-kit/sortable';
@@ -392,11 +392,20 @@ const GoLiveModal = ({ channels, title, onStart, onClose, onChannels }) => {
     if (channels.length === 0) return true;
     try { return localStorage.getItem(RECORD_KEY) === '1'; } catch { return false; }
   });
-  const [handle, setHandle] = useState(null);
+  const [handle, setHandle] = useState(null); // a one-off file chosen with "Save somewhere else"
+  const [folder, setFolder] = useState(null); // { handle, label }: Desktop/Live, once set up
   const [error, setError] = useState('');
   const recordOnly = channels.length === 0;
+  const useFolder = canUseFolder();
 
-  const choose = async () => {
+  useEffect(() => { if (useFolder) getSavedFolder().then(setFolder); }, [useFolder]);
+
+  const chooseFolder = async () => {
+    setError('');
+    try { setFolder(await chooseRecordingsFolder()); setHandle(null); } catch (e) { if (e?.name !== 'AbortError') setError('Could not use that folder. Choose your Desktop.'); }
+  };
+
+  const chooseFile = async () => {
     setError('');
     try { setHandle(await pickRecordingFile(recordingName(title))); } catch (e) { if (e?.name !== 'AbortError') setError('Could not choose that place. Try another folder.'); }
   };
@@ -405,12 +414,26 @@ const GoLiveModal = ({ channels, title, onStart, onClose, onChannels }) => {
     setError('');
     if (recordOnly && !record) { setError('Tick a channel in Channels, or turn on the recording.'); return; }
     let file = handle;
-    if (record && !file && canPickFile()) {
-      // Still a click, so the save window may open now
-      try { file = await pickRecordingFile(recordingName(title)); } catch (e) { if (e?.name !== 'AbortError') setError('Could not choose that place.'); return; }
+    let where = handle ? '' : null;
+    try {
+      if (record && !file && useFolder) {
+        // Still a click, so the browser may show its folder window or permission question now
+        let f = folder;
+        if (!f || !(await folderAllowed(f.handle))) f = await chooseRecordingsFolder();
+        setFolder(f);
+        file = await createRecordingFile(f.handle, recordingName(title));
+        where = f.label;
+      } else if (record && !file && canPickFile()) {
+        file = await pickRecordingFile(recordingName(title));
+      }
+    } catch (e) {
+      if (e?.name === 'AbortError') return;
+      console.error('Choosing where to save failed:', e);
+      setError('Could not save there. Use "Save somewhere else this time".');
+      return;
     }
     try { localStorage.setItem(RECORD_KEY, record ? '1' : '0'); } catch { /* this visit only */ }
-    onStart({ record, handle: file });
+    onStart({ record, handle: file, where });
   };
 
   return (
@@ -431,12 +454,28 @@ const GoLiveModal = ({ channels, title, onStart, onClose, onChannels }) => {
             Save a recording on this computer
           </label>
           {record && (
-            canPickFile() ? (
+            handle ? (
+              <div className="flex items-center gap-2 text-xs text-white/70">
+                <span className="truncate">This time: <strong className="text-white">{handle.name}</strong></span>
+                <button type="button" onClick={() => setHandle(null)} className="underline flex-shrink-0">Use {folder?.label || 'Desktop/Live'}</button>
+              </div>
+            ) : useFolder ? (
+              <div className="space-y-1.5">
+                <p className="text-sm">
+                  Saves to <strong>{folder?.label || 'Desktop/Live'}</strong>
+                  {folder && <button type="button" onClick={chooseFolder} className="ml-2 text-xs underline text-white/70">Change folder…</button>}
+                </p>
+                {!folder && (
+                  <p className="text-xs text-white/60">
+                    The first time, your Desktop opens: click <strong>Open</strong> (or Select) and the studio makes the <strong>Live</strong> folder there.
+                  </p>
+                )}
+                {canPickFile() && <button type="button" onClick={chooseFile} className="text-xs underline text-white/60">Save somewhere else this time…</button>}
+              </div>
+            ) : canPickFile() ? (
               <div className="flex items-center gap-2">
-                <button type="button" onClick={choose} className="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-sm font-medium flex-shrink-0">
-                  {handle ? 'Change…' : 'Choose where to save…'}
-                </button>
-                <span className="text-xs text-white/60 truncate">{handle ? handle.name : 'You\'ll pick the folder and name when you start.'}</span>
+                <button type="button" onClick={chooseFile} className="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-sm font-medium flex-shrink-0">Choose where to save…</button>
+                <span className="text-xs text-white/60">You&apos;ll pick the folder and name when you start.</span>
               </div>
             ) : (
               <p className="text-xs text-white/60">The recording downloads when you stop.</p>
@@ -1092,14 +1131,15 @@ const LiveStudio = () => {
     setRecording((r) => (r ? { ...r, finishing: true } : r));
     const { name, bytes } = await rec.stop();
     setRecording(null);
-    setSavedNote(`Recording saved: ${name} (${formatBytes(bytes)}).`);
+    setSavedNote(`Recording saved${rec.where ? ` to ${rec.where}` : ''}: ${name} (${formatBytes(bytes)}).`);
   }, []);
 
   stopRecordingRef.current = stopRecording;
 
-  const startRecording = async (handle) => {
+  const startRecording = async (handle, where) => {
     const name = handle?.name || recordingName(library?.stream?.title);
     const rec = new LocalRecorder(mixer.videoTrack, mixer.audioTrack, handle, name);
+    rec.where = where || '';
     rec.onError = (message) => { setNotice(message); stopRecording(); };
     await rec.start();
     recorderRef.current = rec;
@@ -1127,11 +1167,11 @@ const LiveStudio = () => {
     setShowGoLive(true);
   };
 
-  const startFromModal = async ({ record, handle }) => {
+  const startFromModal = async ({ record, handle, where }) => {
     setShowGoLive(false);
     if (record) {
       try {
-        await startRecording(handle);
+        await startRecording(handle, where);
       } catch (error) {
         console.error('Recording failed to start:', error);
         setNotice(`The recording couldn't start: ${error.message || error}`);

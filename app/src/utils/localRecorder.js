@@ -42,6 +42,64 @@ export const pickRecordingFile = async (suggestedName) => {
   });
 };
 
+// ---------- The recordings folder (Desktop/Live) ----------
+// A web page can't write to a path by itself, so the first time the person picks their Desktop
+// (the window opens there) and the studio makes a "Live" folder in it, or uses the "Live" folder
+// they picked. The folder is remembered in IndexedDB; Chrome may ask again on a later visit.
+
+export const canUseFolder = () => typeof window !== 'undefined' && typeof window.showDirectoryPicker === 'function';
+
+const DB_NAME = 'liveStudioRecording';
+const withStore = (mode, fn) => new Promise((resolve, reject) => {
+  const open = indexedDB.open(DB_NAME, 1);
+  open.onupgradeneeded = () => open.result.createObjectStore('folders');
+  open.onerror = () => reject(open.error);
+  open.onsuccess = () => {
+    const tx = open.result.transaction('folders', mode);
+    const req = fn(tx.objectStore('folders'));
+    tx.oncomplete = () => { open.result.close(); resolve(req?.result); };
+    tx.onerror = () => { open.result.close(); reject(tx.error); };
+  };
+});
+
+// { handle, label } or null
+export const getSavedFolder = async () => {
+  try { return (await withStore('readonly', (store) => store.get('recordings'))) || null; } catch { return null; }
+};
+
+// Must be called from a click. Returns { handle, label } for Desktop/Live (made if it isn't there).
+export const chooseRecordingsFolder = async () => {
+  const picked = await window.showDirectoryPicker({ id: 'live-studio-recordings', mode: 'readwrite', startIn: 'desktop' });
+  const live = picked.name === 'Live' ? picked : await picked.getDirectoryHandle('Live', { create: true });
+  const folder = { handle: live, label: picked.name === 'Live' ? 'Live' : `${picked.name}/Live` };
+  await withStore('readwrite', (store) => store.put(folder, 'recordings')).catch(() => {});
+  return folder;
+};
+
+// Must be called from a click if the browser hasn't kept the permission
+export const folderAllowed = async (handle) => {
+  const opts = { mode: 'readwrite' };
+  if ((await handle.queryPermission?.(opts)) === 'granted') return true;
+  return (await handle.requestPermission?.(opts)) === 'granted';
+};
+
+// A new file in the folder; "name (2).mp4" if the name is taken
+export const createRecordingFile = async (folder, name) => {
+  const dot = name.lastIndexOf('.');
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  for (let i = 1; i < 100; i++) {
+    const candidate = i === 1 ? name : `${base} (${i})${ext}`;
+    try {
+      await folder.getFileHandle(candidate);
+    } catch (error) {
+      if (error?.name === 'NotFoundError') return folder.getFileHandle(candidate, { create: true });
+      throw error;
+    }
+  }
+  throw new Error('Too many recordings with the same name in that folder.');
+};
+
 export const formatBytes = (n) => {
   if (n >= 1e9) return `${(n / 1e9).toFixed(2)} GB`;
   if (n >= 1e6) return `${Math.round(n / 1e6)} MB`;
