@@ -245,9 +245,9 @@ service cloud.firestore {
                        && request.resource.data.get('tickers', []).size() <= 50
                        && request.resource.data.get('qrCodes', []).size() <= 30)
                      || (docId == 'control'
-                       && request.resource.data.keys().hasOnly(['sceneId', 'sceneEndsAt', 'layout', 'swap', 'clip', 'tickerSpeed', 'chatShown', 'cameraRadius', 'screenRadius', 'cameraShape', 'placement', 'logo', 'overlay', 'background', 'lowerThird', 'ticker', 'qr', 'updatedAt', 'updatedBy']))
+                       && request.resource.data.keys().hasOnly(['sceneId', 'sceneEndsAt', 'layout', 'second', 'cameraSource', 'swap', 'clip', 'tickerSpeed', 'chatShown', 'cameraRadius', 'screenRadius', 'cameraShape', 'placement', 'logo', 'overlay', 'background', 'lowerThird', 'ticker', 'qr', 'updatedAt', 'updatedBy']))
                      || (docId == 'monitor'
-                       && request.resource.data.keys().hasOnly(['image', 'sharing', 'cameraOn', 'micMuted', 'helper', 'live', 'updatedAt', 'updatedBy'])
+                       && request.resource.data.keys().hasOnly(['image', 'sharing', 'phone', 'cameraOn', 'micMuted', 'helper', 'live', 'updatedAt', 'updatedBy'])
                        && request.resource.data.image is string
                        && request.resource.data.image.size() < 300000)
                    );
@@ -270,11 +270,43 @@ service cloud.firestore {
                                  && request.resource.data.storagePath.matches('^liveStudioVideos/[A-Za-z0-9_-]+[.](mp4|mov|m4v|webm)$')
                                  && request.resource.data.size is number
                                  && request.resource.data.duration is number))
+                            // A GIF overlay also lives in Storage
+                            && (request.resource.data.kind != 'overlay' || !('storagePath' in request.resource.data) || (
+                                 request.resource.data.storagePath is string
+                                 && request.resource.data.storagePath.matches('^liveStudioVideos/[A-Za-z0-9_-]+[.]gif$')
+                                 && request.resource.data.size is number))
                             && request.resource.data.name is string
                             && request.resource.data.name.size() <= 80
                             && request.resource.data.dataUrl is string
                             && request.resource.data.dataUrl.matches('^data:image/(png|jpeg);base64,.*')
                             && request.resource.data.dataUrl.size() < 1000000;
+    }
+
+    // Phone camera links for Live Studio (app/src/utils/phoneCamera.js). The token (doc id, 40
+    // random characters) is the secret: a phone with the link can read the doc and write its
+    // offer, but nobody can list the links. Only members can make, change or delete them.
+    match /livePhoneLinks/{token} {
+      allow get: if token.size() >= 32;
+      allow create: if token.size() >= 32
+                    && isMember()
+                    && request.resource.data.uid == request.auth.uid
+                    && request.resource.data.keys().hasOnly(['uid', 'createdAt']);
+      allow update: if (isMember()
+                        && request.resource.data.uid == resource.data.uid
+                        && request.resource.data.keys().hasOnly(['uid', 'createdAt', 'offer', 'answer', 'phone', 'kick'])
+                        && (!('answer' in request.resource.data) || (request.resource.data.answer is map
+                            && request.resource.data.answer.keys().hasOnly(['id', 'sdp'])
+                            && request.resource.data.answer.sdp is string
+                            && request.resource.data.answer.sdp.size() < 30000)))
+                    || (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['offer', 'phone'])
+                        && request.resource.data.offer is map
+                        && request.resource.data.offer.keys().hasOnly(['id', 'sdp', 'at'])
+                        && request.resource.data.offer.id is string && request.resource.data.offer.id.size() <= 40
+                        && request.resource.data.offer.sdp is string && request.resource.data.offer.sdp.size() < 30000
+                        && request.resource.data.offer.at is number
+                        && (!('phone' in request.resource.data) || (request.resource.data.phone is map
+                            && request.resource.data.phone.keys().hasOnly(['facing', 'mic', 'at']))));
+      allow delete: if isMember();
     }
 
     // Everything else is closed

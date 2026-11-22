@@ -28,7 +28,8 @@ export const liveStudioVideo = onRequest(
       const id = String(req.query.id || '');
       if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) { res.status(400).send('Bad clip id.'); return; }
       const asset = (await admin.firestore().collection('liveStudioAssets').doc(id).get()).data();
-      if (!asset || asset.kind !== 'video' || typeof asset.storagePath !== 'string' || !asset.storagePath.startsWith('liveStudioVideos/')) {
+      // Clips (kind 'video'), moving backgrounds (kind 'background' with a video file) and GIF overlays
+      if (!asset || !['video', 'background', 'overlay'].includes(asset.kind) || typeof asset.storagePath !== 'string' || !asset.storagePath.startsWith('liveStudioVideos/')) {
         res.status(404).send('Clip not found.');
         return;
       }

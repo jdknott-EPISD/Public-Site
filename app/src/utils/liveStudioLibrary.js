@@ -111,7 +111,7 @@ export const DEFAULT_CONTROL = {
   sceneEndsAt: 0,
   layout: 'camera',
   swap: false,
-  clip: null, // { id, startedAt } while a video clip plays
+  clip: null, // { id, startedAt, sceneId? } while a video clip plays (sceneId: started by a Media scene)
   tickerSpeed: 110, // pixels per second
   chatShown: null, // { id, author, text, platform }: a chat message on screen
   cameraRadius: 12,
@@ -190,7 +190,8 @@ const describeVideo = (file) => new Promise((resolve, reject) => {
   video.src = url;
 });
 
-export const addVideo = async (file, onProgress) => {
+// kind: 'video' for a clip, 'background' for a moving background (loops silently)
+export const addVideo = async (file, onProgress, kind = 'video') => {
   const ext = (file.name.split('.').pop() || '').toLowerCase();
   if (!['mp4', 'mov', 'm4v', 'webm'].includes(ext)) throw new Error('Use an MP4, MOV or WebM video.');
   if (file.size > MAX_VIDEO_BYTES) throw new Error('That video is over 300 MB. Shorten or compress it first.');
@@ -203,7 +204,7 @@ export const addVideo = async (file, onProgress) => {
     task.on('state_changed', (snap) => onProgress?.(snap.bytesTransferred / snap.totalBytes), reject, resolve);
   });
   await setDoc(doc(db, 'liveStudioAssets', id), {
-    kind: 'video',
+    kind,
     name: (file.name || 'Video').replace(/\.[^.]+$/, '').slice(0, 80),
     dataUrl: thumbnail,
     storagePath,
@@ -211,14 +212,46 @@ export const addVideo = async (file, onProgress) => {
     duration,
     createdAt: new Date().toISOString()
   });
+  return id;
 };
+
+// An animated GIF overlay: the file goes to Storage like a clip (GIFs are too big for Firestore);
+// the asset keeps a still first frame as its thumbnail. The streaming computer downloads the
+// GIF with loadClip and the mixer plays it.
+const MAX_GIF_BYTES = 25 * 1024 * 1024;
+export const isGifFile = (file) => file?.type === 'image/gif' || /\.gif$/i.test(file?.name || '');
+export const addGifOverlay = async (file, onProgress) => {
+  if (file.size > MAX_GIF_BYTES) throw new Error('That GIF is over 25 MB. Make it smaller (fewer frames or a smaller size) first.');
+  const thumbnail = await imageFileToDataUrl(file, 'logo');
+  const id = newId();
+  const storagePath = `liveStudioVideos/${id}.gif`;
+  await new Promise((resolve, reject) => {
+    const task = uploadBytesResumable(storageRef(storage, storagePath), file, { contentType: 'image/gif' });
+    task.on('state_changed', (snap) => onProgress?.(snap.bytesTransferred / snap.totalBytes), reject, resolve);
+  });
+  await setDoc(doc(db, 'liveStudioAssets', id), {
+    kind: 'overlay',
+    name: (file.name || 'GIF').replace(/\.[^.]+$/, '').slice(0, 80),
+    dataUrl: thumbnail,
+    storagePath,
+    size: file.size,
+    duration: 0,
+    createdAt: new Date().toISOString()
+  });
+  return id;
+};
+
+export const isGifAsset = (asset) => /\.gif$/i.test(asset?.storagePath || '');
 
 export const removeVideo = async (asset) => {
   if (asset.storagePath) await deleteObject(storageRef(storage, asset.storagePath)).catch(() => {});
   await deleteDoc(doc(db, 'liveStudioAssets', asset.id));
 };
 
-// Download a clip into memory once; returns a blob: URL the stream canvas can draw
+// Has a file in Storage (a clip, a moving background, or a GIF overlay)
+export const isVideoAsset = (asset) => !!asset?.storagePath;
+
+// Download a clip (or moving background) into memory once; returns a blob: URL the stream canvas can draw
 const clipCache = new Map();
 export const loadClip = (assetId) => {
   if (!clipCache.has(assetId)) {

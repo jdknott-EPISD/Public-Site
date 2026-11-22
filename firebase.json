@@ -122,6 +122,10 @@
         "destination": "/app/index.html"
       },
       {
+        "source": "/phone-cam/**",
+        "destination": "/app/index.html"
+      },
+      {
         "source": "/newsletter",
         "destination": "/app/index.html"
       }

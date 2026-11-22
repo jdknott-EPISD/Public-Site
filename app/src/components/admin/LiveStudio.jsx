@@ -16,8 +16,13 @@ import { httpsCallable } from 'firebase/functions';
 import { db, functions } from '../../firebase/config';
 import { useMemberAuth } from '../../context/MemberAuthContext';
 import { StudioMixer, LAYOUTS, WIDTH, HEIGHT, loadImage } from '../../utils/liveMixer';
-import { loadClip, newId, postMonitor, useStudioControl, useStudioLibrary, useStudioMonitor } from '../../utils/liveStudioLibrary';
+import { addVideo, isGifAsset, isVideoAsset, loadClip, newId, postMonitor, useStudioControl, useStudioLibrary, useStudioMonitor } from '../../utils/liveStudioLibrary';
 import { HelperStream, INSTALL_COMMAND, getHelperStatus } from '../../utils/streamHelper';
+import { usePhoneCamera } from '../../utils/phoneCamera';
+import PhoneCameraModal from '../live/PhoneCameraModal';
+import { DndContext, closestCenter, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core';
+import { arrayMove, SortableContext, sortableKeyboardCoordinates, rectSortingStrategy, useSortable } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import {
   CaptionsPanel, ChatPanel, DestinationsPanel, Field, GraphicsPanel, Icon, ICONS, Modal, MusicPanel, QrPanel,
   darkInput, qrDataUrl
@@ -63,7 +68,29 @@ const PANELS = [
 const SCENE_KINDS = {
   live: 'Live (camera and screen)',
   countdown: 'Countdown',
-  card: 'Title card'
+  card: 'Title card',
+  media: 'Media (intro or outro video)'
+};
+
+// One scene in the list; children get the drag handle's props
+const SortableScene = ({ id, children }) => {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
+  return (
+    <div ref={setNodeRef} style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.5 : 1, zIndex: isDragging ? 10 : undefined }}
+      className="relative flex-shrink-0 w-40 lg:w-auto group">
+      {children({ ...attributes, ...listeners, style: { touchAction: 'none' } })}
+    </div>
+  );
+};
+
+// A Media scene's "next scene in the list" (Live if it's the last one)
+const NEXT_IN_LIST = 'next';
+const sceneAfter = (scenes, scene, liveScene) => {
+  if (scene.thenSceneId === NEXT_IN_LIST) {
+    const i = scenes.findIndex((s) => s.id === scene.id);
+    return (i >= 0 && scenes[i + 1]) || liveScene;
+  }
+  return scenes.find((s) => s.id === scene.thenSceneId && s.id !== scene.id) || liveScene;
 };
 
 // ---------- Scene editor ----------
@@ -98,14 +125,32 @@ const ColorChoice = ({ label, value, onChange, allowSame }) => (
   </div>
 );
 
-const SceneForm = ({ scene, backgrounds, onSave, onDelete, onClose }) => {
-  const [draft, setDraft] = useState({ name: '', kind: 'card', text: '', minutes: 5, backgroundId: '', thenLive: true, textColor: '#ffffff', numberColor: '', ...scene });
+const SceneForm = ({ scene, scenes, backgrounds, videos, onSave, onDelete, onClose }) => {
+  const [draft, setDraft] = useState({ name: '', kind: 'card', text: '', minutes: 5, backgroundId: '', thenLive: true, textColor: '#ffffff', numberColor: '', videoId: '', thenSceneId: NEXT_IN_LIST, ...scene });
   const [error, setError] = useState('');
+  const [progress, setProgress] = useState(null);
+  const fileRef = useRef(null);
   const set = (changes) => setDraft((d) => ({ ...d, ...changes }));
+  const otherScenes = scenes.filter((s) => s.id !== draft.id);
+  const upload = async (file) => {
+    if (!file) return;
+    setError('');
+    setProgress(0);
+    try {
+      const id = await addVideo(file, setProgress);
+      setDraft((d) => ({ ...d, videoId: id, name: d.name || file.name.replace(/\.[^.]+$/, '').slice(0, 40) }));
+    } catch (err) {
+      console.error('Video upload failed:', err);
+      setError(err.message || 'Upload failed.');
+    }
+    setProgress(null);
+  };
   return (
     <Modal title={scene.id ? 'Edit scene' : 'Add a scene'} onClose={onClose} error={error}
       onSubmit={() => {
+        if (progress !== null) { setError('Wait for the video to finish uploading.'); return; }
         if (!draft.name.trim()) { setError('Give the scene a name.'); return; }
+        if (draft.kind === 'media' && !videos.some((v) => v.id === draft.videoId)) { setError('Choose or upload a video.'); return; }
         const minutes = Math.min(180, Math.max(0.25, Number(draft.minutes) || 5));
         onSave({ ...draft, id: draft.id || newId(), name: draft.name.trim().slice(0, 40), text: (draft.text || '').slice(0, 300), minutes });
       }}>
@@ -115,12 +160,39 @@ const SceneForm = ({ scene, backgrounds, onSave, onDelete, onClose }) => {
           {Object.entries(SCENE_KINDS).map(([id, label]) => <option key={id} value={id} className="text-black">{label}</option>)}
         </select>
       </Field>
-      {draft.kind !== 'live' && (
+      {draft.kind === 'media' && (
+        <>
+          <Field label="Video" hint="Plays full screen with its sound. MP4 works best (up to 300 MB).">
+            <div className="flex gap-2">
+              <select value={draft.videoId || ''} onChange={(e) => set({ videoId: e.target.value })} className={darkInput}>
+                <option value="" className="text-black">Choose a video…</option>
+                {videos.map((v) => <option key={v.id} value={v.id} className="text-black">{v.name}</option>)}
+              </select>
+              <button type="button" onClick={() => fileRef.current?.click()} disabled={progress !== null}
+                className="flex-shrink-0 px-3 rounded-lg bg-white/10 hover:bg-white/15 text-sm font-medium disabled:opacity-60">
+                {progress !== null ? `Uploading ${Math.round(progress * 100)}%` : 'Upload'}
+              </button>
+              <input ref={fileRef} type="file" accept="video/mp4,video/quicktime,video/webm,.mp4,.mov,.m4v,.webm" className="hidden"
+                onChange={(e) => { upload(e.target.files?.[0]); e.target.value = ''; }} />
+            </div>
+          </Field>
+          <Field label="When the video ends, switch to">
+            <select value={draft.thenSceneId || ''} onChange={(e) => set({ thenSceneId: e.target.value })} className={darkInput}>
+              <option value={NEXT_IN_LIST} className="text-black">
+                The next scene in the list{draft.id ? ` (now: ${sceneAfter(scenes, draft, { name: 'Live' }).name})` : ''}
+              </option>
+              <option value="" className="text-black">The Live scene</option>
+              {otherScenes.filter((s) => s.kind !== 'live').map((s) => <option key={s.id} value={s.id} className="text-black">{s.name}</option>)}
+            </select>
+          </Field>
+        </>
+      )}
+      {draft.kind !== 'live' && draft.kind !== 'media' && (
         <Field label="Text" hint="The first line is large. Press Enter for more lines.">
           <textarea rows={3} maxLength={300} value={draft.text} onChange={(e) => set({ text: e.target.value })} className={darkInput} />
         </Field>
       )}
-      {draft.kind !== 'live' && (
+      {draft.kind !== 'live' && draft.kind !== 'media' && (
         <ColorChoice label="Text color" value={draft.textColor || '#ffffff'} onChange={(v) => set({ textColor: v || '#ffffff' })} />
       )}
       {draft.kind === 'countdown' && (
@@ -135,7 +207,21 @@ const SceneForm = ({ scene, backgrounds, onSave, onDelete, onClose }) => {
           </label>
         </>
       )}
-      <Field label="Background" hint="Upload backgrounds under Graphics.">
+      <div>
+        <span className="block text-sm font-medium text-white/80 mb-1">In this scene</span>
+        <div className="flex flex-wrap gap-x-5 gap-y-2">
+          <label className="flex items-center gap-2 text-sm text-white/80">
+            <input type="checkbox" checked={!draft.micOff} onChange={(e) => set({ micOff: !e.target.checked })} className="w-4 h-4 accent-church-blue" />
+            Microphone on
+          </label>
+          <label className="flex items-center gap-2 text-sm text-white/80">
+            <input type="checkbox" checked={!draft.cameraOff} onChange={(e) => set({ cameraOff: !e.target.checked })} className="w-4 h-4 accent-church-blue" />
+            Camera on
+          </label>
+        </div>
+        <p className="mt-1 text-xs text-white/50">Only while this scene is on screen; other scenes keep their own setting.{draft.kind !== 'live' ? ' (Title cards, countdowns and videos never show the camera.)' : ''}</p>
+      </div>
+      <Field label="Background" hint={draft.kind === 'media' ? 'Shown for a moment while the video loads.' : 'Upload backgrounds under Graphics.'}>
         <select value={draft.backgroundId || ''} onChange={(e) => set({ backgroundId: e.target.value })} className={darkInput}>
           <option value="" className="text-black">The studio's background</option>
           {backgrounds.map((b) => <option key={b.id} value={b.id} className="text-black">{b.name}</option>)}
@@ -312,6 +398,7 @@ const LiveStudio = () => {
   const uid = memberProfile?.uid || memberProfile?.id || '';
   const previewRef = useRef(null);
   const meterRef = useRef(null);
+  const phoneMeterRef = useRef(null);
   const outRef = useRef(null); // the HelperStream while this computer is sending
   const streamsRef = useRef({ camera: null, mic: null, screen: null });
   const tickerStartRef = useRef({ id: null, startedAt: 0 });
@@ -350,6 +437,13 @@ const LiveStudio = () => {
     try { localStorage.setItem('studioMirror', on ? '1' : '0'); } catch { /* this visit only */ }
   };
   const [sharing, setSharing] = useState(false);
+  const [showPhone, setShowPhone] = useState(false);
+  const phone = usePhoneCamera(uid, streamer);
+  const phoneLive = !!phone.stream;
+  // The phone's microphone: sent only if turned on at the phone; the studio can mute it (on its own,
+  // not with the computer's microphone). Scenes that turn the microphone off silence it too.
+  const phoneHasMic = !!phone.stream?.getAudioTracks().length;
+  const [phoneMicMuted, setPhoneMicMuted] = useState(false);
   const [mediaError, setMediaError] = useState('');
   const [showSettings, setShowSettings] = useState(false);
 
@@ -373,8 +467,31 @@ const LiveStudio = () => {
   const scenes = useMemo(() => library?.scenes || [], [library]);
   const liveScene = useMemo(() => scenes.find((s) => s.kind === 'live') || { id: 'live', kind: 'live', name: 'Live' }, [scenes]);
   const scene = scenes.find((s) => s.id === control.sceneId) || liveScene;
+  const sceneMicOff = !!scene.micOff;
+  const sceneCameraOff = !!scene.cameraOff;
+  const sceneCameraOffRef = useRef(sceneCameraOff);
   const monitorFresh = !streamer && monitor && Date.now() - Date.parse(monitor.updatedAt || 0) < MONITOR_FRESH_MS;
-  const screenAvailable = streamer ? sharing : !!monitor?.sharing;
+  // The screen's box can show the shared screen or a phone camera
+  const sharingHere = streamer ? sharing : !!monitor?.sharing;
+  const phoneHere = streamer ? phoneLive : !!monitor?.phone;
+  const screenAvailable = sharingHere || phoneHere;
+  // While a screen is shared, the phone can stand in for the webcam (control.cameraSource),
+  // or take the screen's box (control.second). With all three on, the "trio" layout shows them all.
+  const camIsPhone = sharingHere && phoneHere && control.cameraSource === 'phone';
+  const secondIsPhone = phoneHere && !camIsPhone && (!sharingHere || control.second === 'phone');
+  const webcamHere = streamer ? cameraOn && !sceneCameraOff : !!monitor?.cameraOn;
+  const threeAvailable = sharingHere && phoneHere && webcamHere;
+  const pictures = camIsPhone ? 'screen-phone' : secondIsPhone ? 'phone-webcam' : 'screen-webcam';
+  const choosePictures = (id) => updateControl(
+    id === 'screen-phone' ? { cameraSource: 'phone', second: 'screen' }
+      : id === 'phone-webcam' ? { cameraSource: 'webcam', second: 'phone' }
+        : { cameraSource: 'webcam', second: 'screen' });
+  const boxName = secondIsPhone ? 'phone' : 'screen';
+  const layoutLabel = (label) => {
+    if (secondIsPhone) return label.replace('Screen', 'Phone').replace('screen', 'phone');
+    if (camIsPhone) return label.replace('Camera', 'Phone').replace('camera', 'phone');
+    return label;
+  };
 
   // ----- Mixer -----
   useEffect(() => {
@@ -386,6 +503,7 @@ const LiveStudio = () => {
     let frame;
     const meter = () => {
       if (meterRef.current) meterRef.current.style.height = `${Math.round(m.micLevel() * 100)}%`;
+      if (phoneMeterRef.current) phoneMeterRef.current.style.height = `${Math.round(m.phoneLevel() * 100)}%`;
       frame = requestAnimationFrame(meter);
     };
     frame = requestAnimationFrame(meter);
@@ -430,6 +548,8 @@ const LiveStudio = () => {
     mixer.set({
       scene: { kind: scene.kind, text: scene.text || '', endsAt: control.sceneEndsAt || 0, textColor: scene.textColor || '', numberColor: scene.numberColor || '' },
       layout: control.layout,
+      second: control.second || 'screen',
+      cameraSource: control.cameraSource || 'webcam',
       swap: !!control.swap,
       mirrorCamera,
       tickerSpeed: control.tickerSpeed || 110,
@@ -447,11 +567,63 @@ const LiveStudio = () => {
     });
   }, [mixer, scene, control, images, qrImage, mirrorCamera]);
 
+  // ----- Moving background: the streaming computer downloads the video and loops it; elsewhere
+  // (and while it loads) the picture taken from it is shown -----
+  const bgId = images[scene.backgroundId] ? scene.backgroundId : control.background;
+  const bgVideoId = (assets || []).some((a) => a.id === bgId && isVideoAsset(a)) ? bgId : '';
+  useEffect(() => {
+    if (!mixer) return undefined;
+    if (!streamer || !bgVideoId) { mixer.setBackgroundVideo(null); return undefined; }
+    let cancelled = false;
+    loadClip(bgVideoId)
+      .then((url) => { if (!cancelled) mixer.setBackgroundVideo(url); })
+      .catch((error) => {
+        console.error('Moving background failed:', error);
+        if (!cancelled) setNotice(`The moving background couldn't load: ${error.message || error}`);
+      });
+    return () => { cancelled = true; };
+  }, [mixer, streamer, bgVideoId]);
+
+  // ----- Animated GIF overlay: the streaming computer downloads the GIF and plays it; the
+  // still first frame shows meanwhile (and on a co-host's preview) -----
+  const gifOverlayId = (assets || []).some((a) => a.id === control.overlay && isGifAsset(a)) ? control.overlay : '';
+  useEffect(() => {
+    if (!mixer) return undefined;
+    if (!streamer || !gifOverlayId) { mixer.setOverlayGif(null); return undefined; }
+    let cancelled = false;
+    loadClip(gifOverlayId)
+      .then((url) => { if (!cancelled) mixer.setOverlayGif(url); })
+      .catch((error) => {
+        console.error('GIF overlay failed:', error);
+        if (!cancelled) setNotice(`The GIF overlay couldn't load: ${error.message || error}`);
+      });
+    return () => { cancelled = true; };
+  }, [mixer, streamer, gifOverlayId]);
+
   // ----- Video clips: control.clip = { id, startedAt } while one plays (set from any computer);
   // the streaming computer downloads it once and plays it full screen, then clears it -----
   const [clipState, setClipState] = useState(null); // { id, status: 'loading' | 'playing' } here
   const clipId = control.clip?.id || '';
   const clipStartedAt = control.clip?.startedAt || 0;
+
+  // What to put in control to show a scene. A Media scene also starts its video.
+  const sceneChanges = useCallback((s) => ({
+    sceneId: s.id,
+    sceneEndsAt: s.kind === 'countdown' ? Date.now() + (Number(s.minutes) || 5) * 60000 : 0,
+    ...(s.kind === 'media' && s.videoId ? { clip: { id: s.videoId, startedAt: Date.now(), sceneId: s.id } } : {})
+  }), []);
+
+  // A clip ended (or failed). If a Media scene started it and is still on screen, go on to its next scene.
+  const latest = useRef({});
+  latest.current = { control, scenes, liveScene };
+  const finishClip = useCallback(() => {
+    const { control: c, scenes: all, liveScene: live } = latest.current;
+    const from = c.clip?.sceneId && c.sceneId === c.clip.sceneId ? all.find((s) => s.id === c.clip.sceneId) : null;
+    if (!from) { updateControl({ clip: null }); return; }
+    const next = sceneAfter(all, from, live);
+    updateControl({ clip: null, ...sceneChanges(next) });
+  }, [updateControl, sceneChanges]);
+
   useEffect(() => {
     if (!streamer || !mixer) return undefined;
     if (!clipId) { mixer.stopClip(); setClipState(null); return undefined; }
@@ -462,7 +634,7 @@ const LiveStudio = () => {
         if (cancelled) return undefined;
         setClipState({ id: clipId, status: 'playing' });
         return mixer.playClip(url).then(() => {
-          if (!cancelled) { setClipState(null); updateControl({ clip: null }); }
+          if (!cancelled) { setClipState(null); finishClip(); }
         });
       })
       .catch((error) => {
@@ -470,15 +642,15 @@ const LiveStudio = () => {
         console.error('Clip failed:', error);
         setNotice(`The video clip couldn't play: ${error.message || error}`);
         setClipState(null);
-        updateControl({ clip: null });
+        finishClip();
       });
     return () => { cancelled = true; };
-  }, [streamer, mixer, clipId, clipStartedAt, updateControl]);
+  }, [streamer, mixer, clipId, clipStartedAt, finishClip]);
 
   // Download every clip ahead of time on the streaming computer, so clicking one plays at once
   useEffect(() => {
     if (!streamer) return;
-    (assets || []).filter((a) => a.kind === 'video').forEach((a) => { loadClip(a.id).catch(() => {}); });
+    (assets || []).filter(isVideoAsset).forEach((a) => { loadClip(a.id).catch(() => {}); });
   }, [streamer, assets]);
 
   const toggleClip = (asset) => {
@@ -489,10 +661,12 @@ const LiveStudio = () => {
     ? (clipState || (control.clip ? { id: control.clip.id, status: 'loading' } : null))
     : (control.clip ? { id: control.clip.id, status: 'playing' } : null);
 
+  // Leaving a Media scene by hand stops its video
   const switchScene = useCallback((s) => {
     mixer?.resumeAudio();
-    updateControl({ sceneId: s.id, sceneEndsAt: s.kind === 'countdown' ? Date.now() + (Number(s.minutes) || 5) * 60000 : 0 });
-  }, [mixer, updateControl]);
+    const stopClip = latest.current.control.clip?.sceneId && s.kind !== 'media' ? { clip: null } : {};
+    updateControl({ ...stopClip, ...sceneChanges(s) });
+  }, [mixer, updateControl, sceneChanges]);
 
   // Countdown finished: go to the Live scene if the scene says so
   useEffect(() => {
@@ -523,7 +697,7 @@ const LiveStudio = () => {
     }).then((stream) => {
       if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
       streamsRef.current.camera = stream;
-      mixer.setCamera(stream);
+      mixer.setCamera(sceneCameraOffRef.current ? null : stream);
       setMediaError('');
       refreshDevices();
     }).catch((error) => {
@@ -556,7 +730,14 @@ const LiveStudio = () => {
     return () => { cancelled = true; };
   }, [mixer, streamer, micId, refreshDevices]);
 
-  useEffect(() => { mixer?.setMicMuted(micMuted); }, [mixer, micMuted]);
+  // A scene can turn the mic or camera off while it's on screen (the buttons stay as they are).
+  // The camera keeps running, just hidden, so it's back at once on the next scene.
+  useEffect(() => { mixer?.setMicMuted(micMuted || sceneMicOff); }, [mixer, micMuted, sceneMicOff]);
+  useEffect(() => { mixer?.setPhoneMuted(phoneMicMuted || sceneMicOff); }, [mixer, phoneMicMuted, sceneMicOff]);
+  useEffect(() => {
+    sceneCameraOffRef.current = sceneCameraOff;
+    mixer?.setCamera(sceneCameraOff ? null : streamsRef.current.camera || null);
+  }, [mixer, sceneCameraOff]);
 
   const stopSharing = useCallback(() => {
     streamsRef.current.screen?.getTracks().forEach((t) => t.stop());
@@ -579,7 +760,8 @@ const LiveStudio = () => {
       mixer?.setScreen(stream);
       stream.getVideoTracks()[0].addEventListener('ended', stopSharing); // the browser's own "Stop sharing"
       setSharing(true);
-      updateControl({ layout: cameraOn ? 'pip' : 'screen', sceneId: liveScene.id, sceneEndsAt: 0 });
+      // A phone that's already connected stays on, in the webcam's box
+      updateControl({ layout: cameraOn || phoneLive ? 'pip' : 'screen', second: 'screen', cameraSource: phoneLive ? 'phone' : 'webcam', sceneId: liveScene.id, sceneEndsAt: 0 });
     } catch (error) {
       if (error?.name !== 'NotAllowedError') {
         console.error('Screen share error:', error);
@@ -587,6 +769,23 @@ const LiveStudio = () => {
       }
     }
   };
+
+  // ----- Phone camera (streaming computer only) -----
+  useEffect(() => { mixer?.setPhone(phone.stream); }, [mixer, phone.stream]);
+  // When a phone connects, show it: in the screen's box, or (while a screen is shared) in the
+  // webcam's box, so the screen stays
+  const phoneWasLive = useRef(false);
+  useEffect(() => {
+    if (phoneLive && !phoneWasLive.current) {
+      const { control: c, liveScene: live } = latest.current;
+      if (sharing) {
+        updateControl({ cameraSource: 'phone', second: 'screen', ...(['camera', 'screen'].includes(c.layout) ? { layout: 'pip' } : {}) });
+      } else {
+        updateControl({ second: 'phone', cameraSource: 'webcam', ...(c.layout === 'camera' ? { layout: cameraOn ? 'pip' : 'screen', sceneId: live.id, sceneEndsAt: 0 } : {}) });
+      }
+    }
+    phoneWasLive.current = phoneLive;
+  }, [phoneLive, sharing, cameraOn, updateControl]);
 
   // ----- Stream helper (streaming computer only) -----
   const checkHelper = useCallback(async () => {
@@ -613,8 +812,9 @@ const LiveStudio = () => {
       postMonitor({
         image: small.toDataURL('image/jpeg', 0.6),
         sharing,
-        cameraOn,
-        micMuted,
+        phone: phoneLive,
+        cameraOn: cameraOn && !sceneCameraOff,
+        micMuted: micMuted || sceneMicOff,
         live: !!outRef.current,
         helper: helper ? { ok: !!helper.ok, outputs: helper.outputs || [] } : null,
         updatedBy: uid
@@ -623,7 +823,7 @@ const LiveStudio = () => {
     post();
     const id = setInterval(post, MONITOR_EVERY_MS);
     return () => clearInterval(id);
-  }, [streamer, mixer, sharing, cameraOn, micMuted, helper, uid]);
+  }, [streamer, mixer, sharing, phoneLive, cameraOn, micMuted, sceneCameraOff, sceneMicOff, helper, uid]);
 
   // ----- Automatic setup (YouTube, Facebook) -----
   useEffect(() => {
@@ -868,6 +1068,15 @@ const LiveStudio = () => {
   };
 
   // ----- Scenes -----
+  const sceneSensors = useSensors(useSensor(PointerSensor), useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }));
+  const moveScene = ({ active, over }) => {
+    if (!over || active.id === over.id) return;
+    const from = scenes.findIndex((x) => x.id === active.id);
+    const to = scenes.findIndex((x) => x.id === over.id);
+    if (from < 0 || to < 0) return;
+    saveList('scenes', arrayMove(scenes, from, to)).catch((e) => console.error(e));
+  };
+
   const saveScene = (s) => {
     const exists = scenes.some((x) => x.id === s.id);
     saveList('scenes', exists ? scenes.map((x) => (x.id === s.id ? s : x)) : [...scenes, s]).catch((e) => console.error(e));
@@ -884,6 +1093,7 @@ const LiveStudio = () => {
   const broadcastWithResults = broadcast ? { ...broadcast, results: outputs || [] } : null;
 
   const backgrounds = useMemo(() => (assets || []).filter((a) => a.kind === 'background'), [assets]);
+  const videos = useMemo(() => (assets || []).filter((a) => a.kind === 'video'), [assets]);
   const elapsed = broadcast?.startedAt ? formatElapsed(now - new Date(broadcast.startedAt).getTime()) : '';
   const busy = phase === 'starting' || phase === 'stopping';
   const countdownLeft = scene.kind === 'countdown' && control.sceneEndsAt ? Math.max(0, control.sceneEndsAt - now) : 0;
@@ -987,21 +1197,34 @@ const LiveStudio = () => {
         <aside className="lg:w-56 flex-shrink-0 border-b lg:border-b-0 lg:border-r border-white/10 p-3 lg:overflow-y-auto">
           <button onClick={() => setEditingScene({})} className="w-full mb-3 px-4 py-2 rounded-full bg-white/10 hover:bg-white/15 text-sm font-semibold tracking-wide">+ ADD SCENE</button>
           <div className="flex lg:flex-col gap-3 overflow-x-auto lg:overflow-visible pb-1">
+            <DndContext sensors={sceneSensors} collisionDetection={closestCenter} onDragEnd={moveScene}>
+            <SortableContext items={scenes.map((s) => s.id)} strategy={rectSortingStrategy}>
             {scenes.map((s) => {
-              const bg = images[s.backgroundId] || images[control.background];
+              const video = s.kind === 'media' ? videos.find((v) => v.id === s.videoId) : null;
+              const bg = video?.dataUrl ? { src: video.dataUrl } : images[s.backgroundId] || images[control.background];
               const active = s.id === scene.id;
               return (
-                <div key={s.id} className="flex-shrink-0 w-40 lg:w-auto group">
+                <SortableScene key={s.id} id={s.id}>{(handle) => (<>
                   <div className="flex items-center justify-between mb-1">
-                    <span className="text-sm font-medium truncate">{s.name}</span>
+                    <span className="flex items-center gap-1 min-w-0">
+                      <button type="button" {...handle} className="p-0.5 -ml-1 cursor-grab active:cursor-grabbing text-white/40 hover:text-white" aria-label={`Drag to reorder ${s.name}`} title="Drag to reorder">
+                        <Icon d="M5 9h14M5 15h14" className="w-4 h-4" />
+                      </button>
+                      <span className="text-sm font-medium truncate">{s.name}</span>
+                    </span>
                     <button onClick={() => setEditingScene(s)} className="p-1 text-white/50 hover:text-white" aria-label={`Edit ${s.name} scene`}><Icon d={ICONS.edit} className="w-4 h-4" /></button>
                   </div>
                   <button onClick={() => switchScene(s)} aria-label={`Show ${s.name} scene`}
                     className={`relative block w-full aspect-video rounded-lg overflow-hidden bg-gradient-to-br from-church-navy to-church-navy-deep ${active ? 'ring-2 ring-church-blue' : 'ring-1 ring-white/10 hover:ring-white/30'}`}>
                     {bg && <img src={bg.src} alt="" className="absolute inset-0 w-full h-full object-cover opacity-80" />}
                     <span className="absolute inset-0 flex items-center justify-center text-white/80">
-                      <Icon d={s.kind === 'live' ? ICONS.camera : s.kind === 'countdown' ? 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z' : ICONS.captions} className="w-6 h-6" />
+                      <Icon d={s.kind === 'live' ? ICONS.camera : s.kind === 'countdown' ? 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z' : s.kind === 'media' ? 'M8 5v14l11-7z' : ICONS.captions} className="w-6 h-6" />
                     </span>
+                    {s.kind === 'media' && (
+                      <span className="absolute left-1.5 bottom-1.5 px-1.5 py-0.5 rounded bg-black/60 text-xs font-mono">
+                        {video ? `${Math.floor((video.duration || 0) / 60)}:${String(Math.round(video.duration || 0) % 60).padStart(2, '0')}` : 'No video'}
+                      </span>
+                    )}
                     {s.kind === 'countdown' && (
                       <span className="absolute left-1.5 bottom-1.5 px-1.5 py-0.5 rounded bg-black/60 text-xs font-mono">
                         {active && control.sceneEndsAt ? formatElapsed(countdownLeft + 999) : formatElapsed((Number(s.minutes) || 5) * 60000)}
@@ -1009,9 +1232,11 @@ const LiveStudio = () => {
                     )}
                     {active && <span className="absolute right-1.5 top-1.5 px-1.5 py-0.5 rounded bg-church-blue text-[10px] font-bold uppercase">On screen</span>}
                   </button>
-                </div>
+                </>)}</SortableScene>
               );
             })}
+            </SortableContext>
+            </DndContext>
           </div>
         </aside>
 
@@ -1053,20 +1278,21 @@ const LiveStudio = () => {
 
             {scene.kind === 'live' ? (
               <div className="mt-4 flex flex-wrap justify-center gap-2" role="group" aria-label="Layout">
-                {LAYOUTS.map((l) => {
+                {LAYOUTS.filter((l) => !l.needsThree || threeAvailable).map((l) => {
                   const disabled = l.needsScreen && !screenAvailable;
                   const current = (screenAvailable ? control.layout : 'camera') === l.id;
+                  const label = layoutLabel(l.label);
                   return (
                     <button key={l.id} onClick={() => updateControl({ layout: l.id })} disabled={disabled}
-                      title={disabled ? `${l.label} (share a screen on the streaming computer first)` : l.label} aria-label={l.label} aria-pressed={current}
+                      title={disabled ? `${label} (share a screen or connect a phone camera on the streaming computer first)` : label} aria-label={label} aria-pressed={current}
                       className={`p-2 rounded-lg bg-white/5 transition disabled:opacity-30 disabled:cursor-not-allowed ${current ? 'ring-2 ring-church-blue' : 'hover:bg-white/10'}`}>
                       <LayoutIcon boxes={l.boxes} />
                     </button>
                   );
                 })}
                 <button onClick={() => updateControl({ swap: !control.swap })} disabled={!swapAvailable}
-                  title={swapAvailable ? 'Swap the camera and the screen (or drag one onto the other in the preview)' : 'Choose a layout with two boxes to swap them'}
-                  aria-label="Swap camera and screen" aria-pressed={!!control.swap}
+                  title={swapAvailable ? `Swap the camera and the ${boxName} (or drag one onto the other in the preview)` : 'Choose a layout with two boxes to swap them'}
+                  aria-label={`Swap camera and ${boxName}`} aria-pressed={!!control.swap}
                   className={`px-3 rounded-lg bg-white/5 transition text-sm font-medium flex items-center gap-1.5 disabled:opacity-30 disabled:cursor-not-allowed ${control.swap ? 'ring-2 ring-church-blue' : 'hover:bg-white/10'}`}>
                   <Icon d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" className="w-5 h-5" /> Swap
                 </button>
@@ -1074,10 +1300,21 @@ const LiveStudio = () => {
                   className="px-3 rounded-lg bg-white/5 hover:bg-white/10 transition text-sm font-medium flex items-center gap-1.5">
                   <Icon d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" className="w-5 h-5" /> Style
                 </button>
+                {sharingHere && phoneHere && control.layout !== 'trio' && (
+                  <div className="flex items-center rounded-lg bg-white/5 p-1 text-sm" role="group" aria-label="Which two pictures">
+                    {[['screen-webcam', 'Screen + Webcam'], ['screen-phone', 'Screen + Phone'], ['phone-webcam', 'Phone + Webcam']].map(([id, label]) => (
+                      <button key={id} onClick={() => choosePictures(id)} aria-pressed={pictures === id}
+                        title={`Show the ${label.toLowerCase().replace(' + ', ' and the ')}`}
+                        className={`px-3 py-1.5 rounded-md font-medium whitespace-nowrap ${pictures === id ? 'bg-white text-[#18181b]' : 'text-white/70 hover:text-white'}`}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : (
               <p className="mt-4 text-center text-sm text-white/50">
-                Showing the "{scene.name}" scene. Click a Live scene to show the camera{screenAvailable ? ' and screen' : ''}.
+                Showing the "{scene.name}" scene. Click a Live scene to show the camera{screenAvailable ? ` and ${boxName}` : ''}.
               </p>
             )}
 
@@ -1085,14 +1322,14 @@ const LiveStudio = () => {
               <div className="mt-5 flex items-center justify-center gap-3">
                 <button onClick={() => { mixer?.resumeAudio(); setMicMuted((v) => !v); }} className={roundButton(!micMuted)} aria-label={micMuted ? 'Unmute microphone' : 'Mute microphone'} title={micMuted ? 'Unmute' : 'Mute'}>
                   <Icon d={ICONS.mic} className="w-6 h-6" />
-                  {micMuted && <span className="absolute w-7 h-0.5 bg-current rotate-45 rounded" />}
+                  {(micMuted || sceneMicOff) && <span className="absolute w-7 h-0.5 bg-current rotate-45 rounded" />}
                   <span className="absolute -right-1 bottom-1 w-1.5 h-8 rounded-full bg-white/10 overflow-hidden flex items-end">
-                    <span ref={meterRef} className={`block w-full ${micMuted ? 'bg-white/30' : 'bg-green-400'}`} style={{ height: '0%' }} />
+                    <span ref={meterRef} className={`block w-full ${micMuted || sceneMicOff ? 'bg-white/30' : 'bg-green-400'}`} style={{ height: '0%' }} />
                   </span>
                 </button>
                 <button onClick={() => { mixer?.resumeAudio(); setCameraOn((v) => !v); }} className={roundButton(cameraOn)} aria-label={cameraOn ? 'Turn camera off' : 'Turn camera on'} title={cameraOn ? 'Camera off' : 'Camera on'}>
                   <Icon d={ICONS.camera} className="w-6 h-6" />
-                  {!cameraOn && <span className="absolute w-7 h-0.5 bg-current rotate-45 rounded" />}
+                  {(!cameraOn || sceneCameraOff) && <span className="absolute w-7 h-0.5 bg-current rotate-45 rounded" />}
                 </button>
                 {canShareScreen && (
                   <button onClick={sharing ? stopSharing : startSharing}
@@ -1101,16 +1338,46 @@ const LiveStudio = () => {
                     <Icon d={ICONS.screen} className="w-6 h-6" />
                   </button>
                 )}
+                <button onClick={() => { mixer?.resumeAudio(); setShowPhone(true); }}
+                  className={`relative w-12 h-12 rounded-full flex items-center justify-center transition ${phoneLive ? 'bg-church-blue text-white hover:brightness-110' : 'bg-white/10 hover:bg-white/20'}`}
+                  aria-label="Phone camera" title={phoneLive ? 'Phone camera connected' : 'Add a phone camera'}>
+                  <Icon d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" className="w-6 h-6" />
+                  {phone.status === 'connecting' && <span className="absolute top-1 right-1 w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse" />}
+                </button>
+                {phoneLive && (
+                  <button onClick={() => { mixer?.resumeAudio(); setPhoneMicMuted((v) => !v); }} disabled={!phoneHasMic}
+                    className={`${roundButton(phoneHasMic && !phoneMicMuted)} disabled:opacity-40 disabled:cursor-not-allowed`}
+                    aria-label={!phoneHasMic ? 'Phone microphone is off on the phone' : phoneMicMuted ? 'Unmute phone microphone' : 'Mute phone microphone'}
+                    title={!phoneHasMic ? 'The phone isn\'t sending sound. Tap "Mic off" on the phone to turn it on.' : phoneMicMuted ? 'Unmute the phone' : 'Mute the phone (the computer microphone stays as it is)'}>
+                    <Icon d={ICONS.mic} className="w-5 h-5" />
+                    <span className="absolute -bottom-1 text-[9px] font-bold tracking-wide">PHONE</span>
+                    {(!phoneHasMic || phoneMicMuted || sceneMicOff) && <span className="absolute w-7 h-0.5 bg-current rotate-45 rounded" />}
+                    <span className="absolute -right-1 bottom-1 w-1.5 h-8 rounded-full bg-white/10 overflow-hidden flex items-end">
+                      <span ref={phoneMeterRef} className={`block w-full ${!phoneHasMic || phoneMicMuted || sceneMicOff ? 'bg-white/30' : 'bg-green-400'}`} style={{ height: '0%' }} />
+                    </span>
+                  </button>
+                )}
                 <button onClick={() => setShowSettings(true)} className="w-12 h-12 rounded-full flex items-center justify-center bg-white/10 hover:bg-white/20 transition" aria-label="Camera and microphone settings" title="Settings">
                   <Icon d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z" className="w-6 h-6" />
                 </button>
               </div>
-            ) : (
+            ) : null}
+            {(sceneMicOff || sceneCameraOff) && (
+              <p className="mt-2 text-center text-xs text-white/60">
+                The "{scene.name}" scene turns the {[sceneMicOff && 'microphone', sceneCameraOff && 'camera'].filter(Boolean).join(' and ')} off. They come back on the next scene.
+              </p>
+            )}
+            {!streamer && (
               monitorFresh && (
                 <p className="mt-5 text-center text-sm text-white/60">
-                  Streaming computer: camera {monitor.cameraOn ? 'on' : 'off'} · microphone {monitor.micMuted ? 'muted' : 'on'} · screen {monitor.sharing ? 'shared' : 'not shared'}
+                  Streaming computer: camera {monitor.cameraOn ? 'on' : 'off'} · microphone {monitor.micMuted ? 'muted' : 'on'} · screen {monitor.sharing ? 'shared' : 'not shared'}{monitor.phone ? ' · phone camera connected' : ''}
                 </p>
               )
+            )}
+            {streamer && phoneLive && phoneHasMic && !phoneMicMuted && !micMuted && !sceneMicOff && (
+              <p className="mt-3 text-center text-xs text-amber-300">
+                The computer microphone and the phone microphone are both on. If they&apos;re in the same room, viewers may hear an echo: mute one of them.
+              </p>
             )}
             {streamer && sharing && <p className="mt-3 text-center text-xs text-white/40">Sharing a tab with a video? Tick "Also share tab audio" in the browser's share window.</p>}
           </div>
@@ -1137,7 +1404,7 @@ const LiveStudio = () => {
               {library && (
                 <CaptionsPanel library={library} saveList={saveList}
                   activeLowerThird={control.lowerThird?.id} activeTicker={control.ticker?.id}
-                  onLowerThird={(item) => updateControl({ lowerThird: control.lowerThird?.id === item.id ? null : { id: item.id, title: item.title, subtitle: item.subtitle || '' } })}
+                  onLowerThird={(item) => updateControl({ lowerThird: control.lowerThird?.id === item.id ? null : { id: item.id, title: item.title, subtitle: item.subtitle || '', style: item.style || 'classic', frame: !!item.frame } })}
                   onTicker={(item) => updateControl({ ticker: control.ticker?.id === item.id ? null : { id: item.id, text: item.text } })}
                   tickerSpeed={control.tickerSpeed || 110} onTickerSpeed={(v) => updateControl({ tickerSpeed: v })} />
               )}
@@ -1172,8 +1439,9 @@ const LiveStudio = () => {
       </div>
 
       {editingScene && (
-        <SceneForm scene={editingScene} backgrounds={backgrounds} onSave={saveScene} onDelete={() => deleteScene(editingScene)} onClose={() => setEditingScene(null)} />
+        <SceneForm scene={editingScene} scenes={scenes} backgrounds={backgrounds} videos={videos} onSave={saveScene} onDelete={() => deleteScene(editingScene)} onClose={() => setEditingScene(null)} />
       )}
+      {showPhone && streamer && <PhoneCameraModal phone={phone} onClose={() => setShowPhone(false)} />}
       {showStyle && (
         <StyleModal shape={control.cameraShape || 'rect'} cameraRadius={control.cameraRadius ?? 12} screenRadius={control.screenRadius ?? 12}
           layout={screenAvailable ? control.layout : 'camera'} placement={control.placement}

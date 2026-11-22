@@ -1,11 +1,13 @@
 // Live Studio's right-hand panels and the small editors they open.
 // The page (components/admin/LiveStudio.jsx) owns what is on screen; these panels show the
 // saved library and tell the page what to turn on or off.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { collection, doc, setDoc } from 'firebase/firestore';
 import QRCode from 'qrcode';
 import { db } from '../../firebase/config';
-import { addAsset, addVideo, newId, removeAsset, removeVideo } from '../../utils/liveStudioLibrary';
+import { AMBIENT_STYLES } from '../../utils/ambientMusic';
+import { LOWER_THIRD_STYLES, drawLowerThirdSample, loadLowerThirdFonts, styleHasFrame } from '../../utils/lowerThirds';
+import { addAsset, addGifOverlay, addVideo, isGifAsset, isGifFile, isVideoAsset, newId, removeAsset, removeVideo } from '../../utils/liveStudioLibrary';
 
 export const darkInput = 'w-full px-3 py-2 rounded-lg bg-white/10 border border-white/10 text-white placeholder-white/40 focus:ring-2 focus:ring-church-blue focus:border-transparent outline-none';
 const sectionTitle = 'text-sm font-semibold text-white/90';
@@ -312,8 +314,8 @@ export const DestinationsPanel = ({ destinations, selected, onToggle, phase, bro
 
 const GRAPHIC_KINDS = [
   { kind: 'logo', title: 'Logo', hint: 'Shown in the top-left corner during live scenes, and on title cards.' },
-  { kind: 'overlay', title: 'Overlay', hint: 'A full-screen picture on top of everything. Use a 1280×720 PNG with a see-through middle.' },
-  { kind: 'background', title: 'Background', hint: 'Behind the video, title cards, and countdown.' }
+  { kind: 'overlay', title: 'Overlay', hint: 'A full-screen picture on top of everything. Use a 1280×720 PNG with a see-through middle, or an animated GIF (up to 25 MB) to make it move.' },
+  { kind: 'background', title: 'Background', hint: 'Behind the video, title cards, and countdown. A picture, or a short video that loops silently (MP4 works best).' }
 ];
 
 const formatDuration = (s) => `${Math.floor((s || 0) / 60)}:${String(Math.round(s || 0) % 60).padStart(2, '0')}`;
@@ -398,7 +400,13 @@ export const GraphicsPanel = ({ assets, active, onToggle, clip, onClip }) => {
     setBusy(kind);
     setError('');
     try {
-      await addAsset(kind, file);
+      if (kind === 'background' && (file.type.startsWith('video/') || /\.(mp4|mov|m4v|webm)$/i.test(file.name))) {
+        await addVideo(file, (p) => setBusy(`${kind}:${Math.round(p * 100)}`), 'background');
+      } else if (kind === 'overlay' && isGifFile(file)) {
+        await addGifOverlay(file, (p) => setBusy(`${kind}:${Math.round(p * 100)}`));
+      } else {
+        await addAsset(kind, file);
+      }
     } catch (err) {
       console.error('Upload failed:', err);
       setError(err.message || 'Upload failed.');
@@ -409,7 +417,7 @@ export const GraphicsPanel = ({ assets, active, onToggle, clip, onClip }) => {
   const remove = async (asset) => {
     if (!window.confirm(`Remove "${asset.name}" from the studio?`)) return;
     if (active[asset.kind] === asset.id) onToggle(asset.kind, asset.id);
-    await removeAsset(asset.id).catch((err) => console.error(err));
+    await (isVideoAsset(asset) ? removeVideo(asset) : removeAsset(asset.id)).catch((err) => console.error(err));
   };
 
   return (
@@ -423,19 +431,24 @@ export const GraphicsPanel = ({ assets, active, onToggle, clip, onClip }) => {
             {(assets || []).filter((a) => a.kind === kind).map((a) => (
               <div key={a.id} className="relative group">
                 <button onClick={() => onToggle(kind, a.id)} title={a.name}
-                  className={`block w-full aspect-video rounded-lg overflow-hidden bg-[repeating-conic-gradient(#3a3a40_0%_25%,#2c2c31_0%_50%)] bg-[length:16px_16px] ${active[kind] === a.id ? 'ring-2 ring-church-blue' : 'ring-1 ring-white/10 hover:ring-white/30'}`}>
+                  className={`relative block w-full aspect-video rounded-lg overflow-hidden bg-[repeating-conic-gradient(#3a3a40_0%_25%,#2c2c31_0%_50%)] bg-[length:16px_16px] ${active[kind] === a.id ? 'ring-2 ring-church-blue' : 'ring-1 ring-white/10 hover:ring-white/30'}`}>
                   <img src={a.dataUrl} alt={a.name} className={`w-full h-full ${kind === 'background' ? 'object-cover' : 'object-contain'}`} />
+                  {isVideoAsset(a) && (
+                    <span className="absolute left-1 bottom-1 px-1 rounded bg-black/70 text-[10px] font-semibold flex items-center gap-0.5" title={isGifAsset(a) ? 'Animated GIF (moves on the stream)' : 'Moving background'}>
+                      <Icon d="M8 5v14l11-7z" className="w-2.5 h-2.5" /> {isGifAsset(a) ? 'GIF' : 'VIDEO'}
+                    </span>
+                  )}
                 </button>
                 <button onClick={() => remove(a)} className="absolute -top-1.5 -right-1.5 hidden group-hover:flex w-6 h-6 items-center justify-center rounded-full bg-black/80 text-white" aria-label={`Remove ${a.name}`}>
                   <Icon d={ICONS.close} className="w-3.5 h-3.5" />
                 </button>
               </div>
             ))}
-            <button onClick={() => inputs.current[kind]?.click()} disabled={busy === kind}
+            <button onClick={() => inputs.current[kind]?.click()} disabled={busy.split(':')[0] === kind}
               className="aspect-video rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center text-white/80" aria-label={`Upload a ${title.toLowerCase()}`}>
-              {busy === kind ? <span className="text-xs">Uploading…</span> : <Icon d={ICONS.plus} className="w-6 h-6" />}
+              {busy.split(':')[0] === kind ? <span className="text-xs">Uploading…{busy.includes(':') ? ` ${busy.split(':')[1]}%` : ''}</span> : <Icon d={ICONS.plus} className="w-6 h-6" />}
             </button>
-            <input ref={(el) => { inputs.current[kind] = el; }} type="file" accept="image/png,image/jpeg,image/webp" className="hidden"
+            <input ref={(el) => { inputs.current[kind] = el; }} type="file" accept={kind === 'background' ? 'image/png,image/jpeg,image/webp,video/mp4,video/quicktime,video/webm,.mp4,.mov,.m4v,.webm' : kind === 'overlay' ? 'image/png,image/jpeg,image/webp,image/gif,.gif' : 'image/png,image/jpeg,image/webp'} className="hidden"
               onChange={(e) => { upload(kind, e.target.files?.[0]); e.target.value = ''; }} />
           </div>
         </section>
@@ -447,15 +460,47 @@ export const GraphicsPanel = ({ assets, active, onToggle, clip, onClip }) => {
 
 // ---------- Captions: lower thirds and ticker ----------
 
+// A small picture of how the lower third will look
+const LowerThirdSample = ({ item, className = '' }) => {
+  const ref = useRef(null);
+  const [fontsReady, setFontsReady] = useState(false);
+  useEffect(() => { loadLowerThirdFonts().then(() => setFontsReady(true)); }, []);
+  useEffect(() => { if (ref.current) drawLowerThirdSample(ref.current, item); }, [item, fontsReady]);
+  return <canvas ref={ref} width={640} height={360} className={`w-full rounded-lg ${className}`} />;
+};
+
 const LowerThirdForm = ({ item, onSave, onClose }) => {
   const [title, setTitle] = useState(item.title || '');
   const [subtitle, setSubtitle] = useState(item.subtitle || '');
+  const [style, setStyle] = useState(item.style || 'teal');
+  const [frame, setFrame] = useState(!!item.frame);
   const [error, setError] = useState('');
+  const sample = useMemo(() => ({ title: title.trim() || 'Your Name', subtitle: subtitle.trim(), style, frame: frame && styleHasFrame(style) }), [title, subtitle, style, frame]);
   return (
     <Modal title={item.id ? 'Edit lower third' : 'Add a lower third'} onClose={onClose} error={error}
-      onSubmit={() => { if (!title.trim()) { setError('Add a name or title.'); return; } onSave({ id: item.id || newId(), title: title.trim(), subtitle: subtitle.trim() }); }}>
+      onSubmit={() => { if (!title.trim()) { setError('Add a name or title.'); return; } onSave({ id: item.id || newId(), title: title.trim(), subtitle: subtitle.trim(), style, frame: frame && styleHasFrame(style) }); }}>
       <Field label="Name or title"><input autoFocus type="text" maxLength={80} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Pastor Name" className={darkInput} /></Field>
-      <Field label="Second line (optional)"><input type="text" maxLength={100} value={subtitle} onChange={(e) => setSubtitle(e.target.value)} placeholder="e.g. Find Your Place / Encuentra tu Lugar" className={darkInput} /></Field>
+      <Field label="Second line (optional)" hint="A | between words is drawn in the style's accent color.">
+        <input type="text" maxLength={100} value={subtitle} onChange={(e) => setSubtitle(e.target.value)} placeholder="e.g. Pastor | Your Church Name" className={darkInput} />
+      </Field>
+      <div>
+        <span className="block text-sm font-medium text-white/80 mb-1">Style</span>
+        <div className="flex flex-wrap gap-2">
+          {LOWER_THIRD_STYLES.map((s) => (
+            <button key={s.id} type="button" onClick={() => setStyle(s.id)}
+              className={`px-3 py-1.5 rounded-lg text-sm border ${style === s.id ? 'bg-church-blue border-church-blue text-white' : 'bg-white/5 border-white/10 text-white/80 hover:bg-white/10'}`}>
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {styleHasFrame(style) && (
+        <label className="flex items-center gap-2 text-sm text-white/80">
+          <input type="checkbox" checked={frame} onChange={(e) => setFrame(e.target.checked)} />
+          Add the matching frame around the picture
+        </label>
+      )}
+      <LowerThirdSample item={sample} />
     </Modal>
   );
 };
@@ -506,6 +551,7 @@ export const CaptionsPanel = ({ library, saveList, activeLowerThird, activeTicke
               <button onClick={() => onLowerThird(item)} className="flex-1 min-w-0 text-left">
                 <p className="font-semibold truncate">{item.title}</p>
                 {item.subtitle && <p className="text-sm text-white/70 truncate">{item.subtitle}</p>}
+                <p className="text-xs text-white/40 mt-0.5">{(LOWER_THIRD_STYLES.find((st) => st.id === (item.style || 'classic')) || LOWER_THIRD_STYLES[0]).label}{item.frame ? ' + frame' : ''}</p>
               </button>
               <RowActions name={item.title} onEdit={() => lowerThirds.setEditing(item)} onRemove={() => lowerThirds.remove(item)} />
             </div>
@@ -608,9 +654,13 @@ export const QrPanel = ({ library, saveList, activeQr, onQr }) => {
 
 export const MusicPanel = ({ mixer }) => {
   const [tracks, setTracks] = useState([]);
-  const [playing, setPlaying] = useState(null);
+  const [playing, setPlaying] = useState(null); // a track id, or 'ambient:<style>'
   const [volume, setVolume] = useState(0.5);
+  const [listen, setListen] = useState(false);
   const inputRef = useRef(null);
+  useEffect(() => { mixer?.setMusicMonitor(listen); }, [mixer, listen]);
+  // Stop the made-in-browser music and the listening when the panel closes
+  useEffect(() => () => { mixer?.stopAmbient(); mixer?.setMusicMonitor(false); }, [mixer]);
 
   // Free the files' memory when the panel goes away (not on every change: they're still in use)
   const tracksRef = useRef(tracks);
@@ -628,7 +678,11 @@ export const MusicPanel = ({ mixer }) => {
     if (playing === track.id) {
       mixer.pauseMusic();
       setPlaying(null);
+    } else if (track.ambient) {
+      mixer.playAmbient(track.ambient);
+      setPlaying(track.id);
     } else {
+      mixer.stopAmbient();
       mixer.playMusic(track.url).then(() => setPlaying(track.id)).catch((e) => console.error('Music error:', e));
     }
   };
@@ -648,6 +702,32 @@ export const MusicPanel = ({ mixer }) => {
         <span className="text-white/70 w-16">Volume</span>
         <input type="range" min="0" max="1" step="0.05" value={volume} onChange={(e) => setVolume(Number(e.target.value))} className="flex-1 accent-church-blue" />
       </label>
+      <label className="flex items-center gap-2 text-sm text-white/80">
+        <input type="checkbox" checked={listen} onChange={(e) => { mixer?.resumeAudio(); setListen(e.target.checked); }} className="w-4 h-4 accent-church-blue" />
+        Hear the music on this computer (use headphones in the sanctuary)
+      </label>
+
+      <div>
+        <h4 className="text-xs font-semibold uppercase tracking-wide text-white/60 mb-1">Soft instrumentals</h4>
+        <p className="text-xs text-white/50 mb-2">Made live by the studio, so it's free to stream and never gets a copyright claim.</p>
+        <div className="space-y-2">
+          {AMBIENT_STYLES.map((st) => {
+            const id = `ambient:${st.id}`;
+            const on = playing === id;
+            return (
+              <button key={id} onClick={() => (on ? (mixer?.stopAmbient(), setPlaying(null)) : toggle({ id, ambient: st.id }))} className={`flex items-center gap-3 ${itemCard(on)}`}>
+                <Icon d={on ? ICONS.pause : ICONS.play} className="w-6 h-6 flex-shrink-0" />
+                <span className="min-w-0">
+                  <span className="block truncate font-medium">{st.name}</span>
+                  <span className="block truncate text-xs text-white/50">{st.hint}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <h4 className="text-xs font-semibold uppercase tracking-wide text-white/60">Your music files</h4>
       <div className="space-y-2">
         {tracks.map((t) => (
           <button key={t.id} onClick={() => toggle(t)} className={`flex items-center gap-3 ${itemCard(playing === t.id)}`}>

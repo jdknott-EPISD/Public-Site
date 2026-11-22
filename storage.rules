@@ -38,14 +38,17 @@ service firebase.storage {
       allow write: if isMember() && spaceId == 'church' && isImageUnder(5 * 1024 * 1024);
     }
 
-    // Live Studio video clips (intros, outros). Only members can see them: the studio downloads
+    // Live Studio video clips (intros, outros), moving backgrounds and GIF overlays. Only members can see them: the studio downloads
     // them through the liveStudioVideo Cloud Function, so they never need to be public.
     match /liveStudioVideos/{fileName} {
       allow read: if isMember();
       allow write: if isMember()
-                   && fileName.matches('^[A-Za-z0-9_-]+[.](mp4|mov|m4v|webm)$')
+                   && fileName.matches('^[A-Za-z0-9_-]+[.](mp4|mov|m4v|webm|gif)$')
                    && (request.resource == null
-                       || (request.resource.contentType.matches('video/.*') && request.resource.size < 300 * 1024 * 1024));
+                       || (fileName.matches('.*[.]gif$')
+                           && request.resource.contentType == 'image/gif' && request.resource.size < 25 * 1024 * 1024)
+                       || (!fileName.matches('.*[.]gif$')
+                           && request.resource.contentType.matches('video/.*') && request.resource.size < 300 * 1024 * 1024));
     }
 
     // Everything else is closed

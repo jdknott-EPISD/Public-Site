@@ -15,6 +15,7 @@ const NewsletterManager = React.lazy(() => import('./components/admin/Newsletter
 const NewsletterEditorWrapper = React.lazy(() => import('./components/admin/NewsletterEditorWrapper'));
 const FormResponses = React.lazy(() => import('./components/admin/FormResponses'));
 const LiveStudio = React.lazy(() => import('./components/admin/LiveStudio'));
+const PhoneCameraPage = React.lazy(() => import('./components/live/PhoneCameraPage'));
 const SharePage = React.lazy(() => import('./components/share/SharePage'));
 const NewsletterPublicView = React.lazy(() => import('./components/newsletter/NewsletterPublicView'));
 const NewsletterArchive = React.lazy(() => import('./components/newsletter/NewsletterArchive'));
@@ -53,6 +54,8 @@ function App() {
 
             {/* Public pages anyone can open */}
             <Route path="/share" element={<SharePage />} />
+            {/* Live Studio phone camera (no sign-in; the link's token is the key) */}
+            <Route path="/phone-cam/:token" element={<PhoneCameraPage />} />
             {/* Older personal links (/share/<account id>) all go to the one church page */}
             <Route path="/share/*" element={<Navigate to="/share" replace />} />
             <Route path="/newsletter/:memberId" element={<NewsletterPublicView />} />

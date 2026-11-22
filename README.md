@@ -16,7 +16,9 @@ A free, open-source website for a church: a bilingual (English/Español) public 
   - **Scenes**: a countdown before the service, title cards (Welcome, Thank you), the live camera and screen.
   - **Graphics**: logo, overlay and background; **captions**: lower thirds and a scrolling ticker; **QR codes** (for example your giving page).
   - **Chat**: YouTube live chat and Facebook comments together; reply as the church on either, and show a message on the stream.
-  - **Video clips** (intros, outros, announcements) played full screen with sound, and **music** from the computer.
+  - **Video clips** (intros, outros, announcements) played full screen with sound, **Media scenes** that play an intro or outro and then move on, and **music** from the computer or soft instrumental music made in the browser.
+  - **Phone camera**: scan a QR code with a phone and its camera (and, if you like, its microphone) becomes a second camera, straight to the streaming computer. Show it with the webcam, with a shared screen, or all three at once; the studio can mute the phone's mic on its own.
+  - **Lower third styles** (Classic, Cream & serif, Navy & gold, Teal tech, Clean slate) with optional matching frames, **animated GIF overlays**, and **moving (video) backgrounds**.
   - **Co-host**: a second computer switches scenes, layouts, graphics and captions while the streaming computer sends the video.
   - **Automatic YouTube/Facebook setup**: once connected, GO LIVE creates the YouTube broadcast and the Facebook live video itself. Plain stream keys (any RTMP service, such as Twitch) work too.
 

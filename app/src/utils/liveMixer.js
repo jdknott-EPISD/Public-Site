@@ -13,6 +13,9 @@
 // Every image drawn here must be same-origin (data: URLs or /images/...). A picture from
 // another site would "taint" the canvas and the browser would stop the stream.
 
+import { AmbientMusic } from './ambientMusic';
+import { drawLowerThird, drawLowerThirdFrame, loadLowerThirdFonts } from './lowerThirds';
+
 export const WIDTH = 1280;
 export const HEIGHT = 720;
 const FPS = 30;
@@ -25,7 +28,9 @@ export const LAYOUTS = [
   { id: 'side', label: 'Screen large, camera beside', boxes: [[0, 0.1, 0.66, 0.8], [0.69, 0.25, 0.31, 0.5]], needsScreen: true },
   { id: 'split', label: 'Screen and camera, same size', boxes: [[0, 0.2, 0.49, 0.6], [0.51, 0.2, 0.49, 0.6]], needsScreen: true },
   { id: 'splitTall', label: 'Screen and camera, equal halves (full height)', boxes: [[0, 0, 0.49, 1], [0.51, 0, 0.49, 1]], needsScreen: true },
-  { id: 'cameraPip', label: 'Camera with screen in the corner', boxes: [[0, 0, 1, 1], [0.7, 0.66, 0.26, 0.28]], needsScreen: true }
+  { id: 'cameraPip', label: 'Camera with screen in the corner', boxes: [[0, 0, 1, 1], [0.7, 0.66, 0.26, 0.28]], needsScreen: true },
+  // Only offered while a screen is shared and both the webcam and a phone camera are on
+  { id: 'trio', label: 'Screen large, webcam and phone beside it', boxes: [[0, 0.12, 0.66, 0.76], [0.69, 0.14, 0.31, 0.34], [0.69, 0.52, 0.31, 0.34]], needsScreen: true, needsThree: true }
 ];
 
 const NAVY = '#10295e';
@@ -125,6 +130,65 @@ export const formatCountdown = (ms) => {
   return h ? `${h}:${m}:${sec}` : `${m}:${sec}`;
 };
 
+// An animated GIF overlay. Frames are decoded one at a time with the browser's ImageDecoder and
+// moved on from the draw loop (which keeps running in a background tab, unlike setTimeout).
+// Without ImageDecoder, the first frame is shown still.
+class GifOverlay {
+  constructor(url) {
+    this.frame = null;
+    this.index = 0;
+    this.nextAt = 0;
+    this.pending = false;
+    this.closed = false;
+    this.load(url);
+  }
+
+  async load(url) {
+    try {
+      const data = await (await fetch(url)).arrayBuffer();
+      if (this.closed) return;
+      const { ImageDecoder } = window;
+      if (typeof ImageDecoder === 'undefined') {
+        this.frame = await createImageBitmap(new Blob([data], { type: 'image/gif' }));
+        return;
+      }
+      const decoder = new ImageDecoder({ data, type: 'image/gif' });
+      await decoder.tracks.ready;
+      await decoder.completed;
+      if (this.closed) { decoder.close(); return; }
+      this.decoder = decoder;
+      this.count = Math.max(1, decoder.tracks.selectedTrack?.frameCount || 1);
+      this.tick(performance.now());
+    } catch (error) {
+      console.error('GIF overlay failed:', error);
+    }
+  }
+
+  // Called every draw: start decoding the next frame once the current one has had its time
+  tick(now) {
+    if (!this.decoder || this.pending || this.closed || now < this.nextAt) return;
+    this.pending = true;
+    this.decoder.decode({ frameIndex: this.index }).then(({ image }) => {
+      this.pending = false;
+      if (this.closed) { image.close(); return; }
+      const old = this.frame;
+      this.frame = image;
+      old?.close?.();
+      // GIF frame times are in microseconds; very short ones play at 10 per second, like browsers do
+      const ms = (image.duration || 0) / 1000;
+      this.nextAt = performance.now() + (ms >= 20 ? ms : 100);
+      this.index = (this.index + 1) % this.count;
+    }).catch(() => { this.pending = false; this.index = 0; });
+  }
+
+  close() {
+    this.closed = true;
+    this.decoder?.close();
+    this.frame?.close?.();
+    this.frame = null;
+  }
+}
+
 export class StudioMixer {
   constructor() {
     this.canvas = document.createElement('canvas');
@@ -135,17 +199,23 @@ export class StudioMixer {
     document.body.appendChild(this.host);
     this.cameraVideo = makeMedia(this.host, 'video');
     this.screenVideo = makeMedia(this.host, 'video');
+    // A phone camera (utils/phoneCamera.js): can fill the screen's box instead of the screen
+    this.phoneVideo = makeMedia(this.host, 'video');
     this.musicEl = makeMedia(this.host, 'audio');
     // Video clips (intros, outros): full screen with their own sound, into the stream only
     this.clipEl = makeMedia(this.host, 'video');
     this.clipEl.muted = false;
     this.clipPlaying = false;
+    // Moving background: loops silently behind everything
+    this.bgVideo = makeMedia(this.host, 'video');
+    this.bgVideo.loop = true;
+    this.bgVideoUrl = '';
     this.churchLogo = null;
     loadImage('/images/logo.png').then((img) => { this.churchLogo = img; });
 
     // What to show. Set with set({...}) from the page.
     this.state = {
-      scene: { kind: 'live' },   // { kind: 'live' | 'countdown' | 'card', text, endsAt }
+      scene: { kind: 'live' },   // { kind: 'live' | 'countdown' | 'card' | 'media', text, endsAt }
       layout: 'camera',
       swap: false,              // trade the camera and screen boxes in two-box layouts
       mirrorCamera: false,      // flip the camera left-to-right
@@ -158,7 +228,9 @@ export class StudioMixer {
       background: null,         // Image
       logo: null,               // Image (top-left corner)
       overlay: null,            // Image (full frame, usually a transparent PNG)
-      lowerThird: null,         // { title, subtitle }
+      second: 'screen',         // what fills the screen's box: 'screen' or 'phone' (falls back to whichever is on)
+      cameraSource: 'webcam',   // what fills the camera's box while a screen is shared: 'webcam' or 'phone'
+      lowerThird: null,         // { title, subtitle, style, frame } (see lowerThirds.js)
       ticker: null,             // { text, startedAt }
       qr: null                  // { image, label }
     };
@@ -177,6 +249,12 @@ export class StudioMixer {
     this.musicGain.connect(this.audioOut);
     this.musicSource = this.audio.createMediaElementSource(this.musicEl);
     this.musicSource.connect(this.musicGain);
+    this.phoneGain = this.audio.createGain();
+    this.phoneGain.connect(this.audioOut);
+    // The phone's meter listens before the mute, so it shows the phone hears you even while muted
+    this.phoneAnalyser = this.audio.createAnalyser();
+    this.phoneAnalyser.fftSize = 512;
+    this.phoneSource = null;
     this.clipGain = this.audio.createGain();
     this.clipGain.connect(this.audioOut);
     this.clipSource = this.audio.createMediaElementSource(this.clipEl);
@@ -185,6 +263,7 @@ export class StudioMixer {
     this.screenSource = null;
     this.levelBuffer = new Uint8Array(this.micAnalyser.fftSize);
 
+    loadLowerThirdFonts();
     this.output = this.canvas.captureStream(FPS);
     this.stopTicker = makeTicker(() => this.draw());
     this.draw();
@@ -218,6 +297,35 @@ export class StudioMixer {
     }
   }
 
+  // The phone's picture, and its microphone if the phone sends one
+  setPhone(stream) {
+    if (this.phoneVideo.srcObject !== stream) {
+      this.phoneVideo.srcObject = stream;
+      if (stream) this.phoneVideo.play().catch(() => {});
+    }
+    if (this.phoneSource) {
+      this.phoneSource.disconnect();
+      this.phoneSource = null;
+    }
+    if (stream && stream.getAudioTracks().length > 0) {
+      this.phoneSource = this.audio.createMediaStreamSource(new MediaStream(stream.getAudioTracks()));
+      this.phoneSource.connect(this.phoneGain);
+      this.phoneSource.connect(this.phoneAnalyser);
+    }
+  }
+
+  // Muting the phone in the studio (separate from the computer's microphone)
+  setPhoneMuted(muted) { this.phoneGain.gain.value = muted ? 0 : 1; }
+
+  // Phone microphone loudness from 0 to 1 (0 when the phone isn't sending sound)
+  phoneLevel() {
+    if (!this.phoneSource) return 0;
+    this.phoneAnalyser.getByteTimeDomainData(this.levelBuffer);
+    let peak = 0;
+    for (const v of this.levelBuffer) peak = Math.max(peak, Math.abs(v - 128));
+    return Math.min(1, peak / 100);
+  }
+
   setMic(stream) {
     if (this.micSource) {
       this.micSource.disconnect();
@@ -234,11 +342,29 @@ export class StudioMixer {
   // Music goes into the stream only (it isn't played out loud in the room)
   playMusic(url, { loop = true } = {}) {
     this.resumeAudio();
+    this.ambient?.stop();
     this.musicEl.src = url;
     this.musicEl.loop = loop;
     return this.musicEl.play();
   }
   pauseMusic() { this.musicEl.pause(); }
+
+  // Soft instrumental music made in the browser (utils/ambientMusic.js), on the same volume
+  playAmbient(styleId) {
+    this.resumeAudio();
+    this.musicEl.pause();
+    if (!this.ambient) this.ambient = new AmbientMusic(this.audio, this.musicGain);
+    this.ambient.start(styleId);
+  }
+  stopAmbient() { this.ambient?.stop(); }
+
+  // Also play the music out of this computer's speakers or headphones, to hear it
+  setMusicMonitor(on) {
+    if (on === !!this.musicMonitored) return;
+    this.musicMonitored = on;
+    if (on) this.musicGain.connect(this.audio.destination);
+    else this.musicGain.disconnect(this.audio.destination);
+  }
 
   // Play a clip full screen; resolves when it ends (or is stopped)
   playClip(url) {
@@ -278,10 +404,36 @@ export class StudioMixer {
 
   // ---------- Drawing ----------
 
+  // A blob: URL of an animated GIF to use as the overlay (instead of the still picture), or null
+  setOverlayGif(url) {
+    if ((url || '') === (this.gifUrl || '')) return;
+    this.gifUrl = url || '';
+    this.gif?.close();
+    this.gif = url ? new GifOverlay(url) : null;
+  }
+
+  // A blob: URL of a looping video to use as the background, or null for the picture one
+  setBackgroundVideo(url) {
+    if ((url || '') === this.bgVideoUrl) return;
+    this.bgVideoUrl = url || '';
+    if (url) {
+      this.bgVideo.src = url;
+      this.bgVideo.play().catch(() => {});
+    } else {
+      this.bgVideo.pause();
+      this.bgVideo.removeAttribute('src');
+      this.bgVideo.load();
+    }
+  }
+
   drawBackground() {
     const { ctx } = this;
     const bg = this.state.background;
-    if (bg) {
+    const v = this.bgVideo;
+    if (this.bgVideoUrl && v.readyState >= 2 && v.videoWidth > 0) {
+      if (v.paused) v.play().catch(() => {});
+      drawFit(ctx, v, v.videoWidth, v.videoHeight, 0, 0, WIDTH, HEIGHT, 'cover');
+    } else if (bg) {
       drawFit(ctx, bg, bg.naturalWidth, bg.naturalHeight, 0, 0, WIDTH, HEIGHT, 'cover');
     } else {
       const g = ctx.createLinearGradient(0, 0, WIDTH, HEIGHT);
@@ -343,10 +495,20 @@ export class StudioMixer {
 
   // bottom: space taken by the ticker, so corner boxes sit above it
   drawLive(bottom = 0) {
-    const cam = this.cameraVideo;
-    const screen = this.screenVideo;
+    const webcam = this.cameraVideo;
+    const phone = this.phoneVideo;
+    const sharedScreen = this.screenVideo;
+    // While a screen is shared, the phone can stand in for the webcam (the screen stays)
+    const phoneAsCamera = this.state.cameraSource === 'phone' && hasFrame(phone) && hasFrame(sharedScreen);
+    const cam = phoneAsCamera ? phone : webcam;
+    // The screen's box shows the shared screen or the phone camera (whichever is chosen, or on)
+    const preferred = phoneAsCamera || this.state.second !== 'phone' ? sharedScreen : phone;
+    const other = preferred === phone ? sharedScreen : phone;
+    const screen = hasFrame(preferred) || phoneAsCamera || !hasFrame(other) ? preferred : other;
     const screenOn = hasFrame(screen);
-    const layout = LAYOUTS.find((l) => l.id === this.state.layout)?.needsScreen && !screenOn ? 'camera' : this.state.layout;
+    const threeOn = hasFrame(sharedScreen) && hasFrame(phone) && hasFrame(webcam);
+    const chosen = LAYOUTS.find((l) => l.id === this.state.layout);
+    const layout = chosen?.needsThree && !threeOn ? 'side' : chosen?.needsScreen && !screenOn ? 'camera' : this.state.layout;
     const pad = 24;
     this.slots = []; // where each source is drawn, for drag-to-swap on the preview
 
@@ -355,7 +517,8 @@ export class StudioMixer {
     const cameraFirst = (layout === 'cameraPip') !== !!this.state.swap;
     const first = cameraFirst ? cam : screen;
     const second = cameraFirst ? screen : cam;
-    const fitOf = (video) => (video === cam ? 'cover' : 'contain');
+    // A sideways phone fills its box like the camera; an upright one is shown whole
+    const fitOf = (video) => (video === webcam || (video === cam && layout !== 'trio') || (video === phone && phone.videoWidth > phone.videoHeight * 1.2) ? 'cover' : 'contain');
     // Box style (Style button): corner rounding for the camera box and the screen box
     // (set separately), and the camera box's shape
     const radiusOf = (value) => (Number.isFinite(Number(value)) ? Number(value) : 12);
@@ -379,11 +542,31 @@ export class StudioMixer {
       this.slots.push({ source: video === cam ? 'camera' : 'screen', x, y, w, h });
     };
 
+    if (layout === 'trio') {
+      // The shared screen large; the webcam and the phone stacked beside it
+      const sw = Math.round(WIDTH * 0.3);
+      const sh = Math.round(sw * 9 / 16);
+      const bigW = WIDTH - sw - pad * 3;
+      const bigH = Math.min(HEIGHT - bottom - pad * 2, Math.round(bigW * 9 / 16));
+      const bigY = (HEIGHT - bottom - bigH) / 2;
+      const sideX = pad * 2 + bigW;
+      const stackY = (HEIGHT - bottom - (sh * 2 + pad)) / 2;
+      const radius = (v) => (Number.isFinite(Number(v)) ? Number(v) : 12);
+      this.drawVideoBox(sharedScreen, pad, bigY, bigW, bigH, 'contain', radius(this.state.screenRadius));
+      this.slots.push({ source: 'screen', x: pad, y: bigY, w: bigW, h: bigH });
+      [webcam, phone].forEach((video, i) => {
+        const y = stackY + i * (sh + pad);
+        this.drawVideoBox(video, sideX, y, sw, sh, video === phone && phone.videoWidth < phone.videoHeight ? 'contain' : 'cover', radius(this.state.cameraRadius));
+        this.slots.push({ source: i === 0 ? 'camera' : 'phone', x: sideX, y, w: sw, h: sh });
+      });
+      return;
+    }
+
     if (layout === 'camera') {
       if (hasFrame(cam)) this.drawVideoBox(cam, 0, 0, WIDTH, HEIGHT, 'cover');
       else this.drawCenteredLogo(0.32);
     } else if (layout === 'screen') {
-      this.drawVideoBox(screen, 0, 0, WIDTH, HEIGHT, 'contain');
+      this.drawVideoBox(screen, 0, 0, WIDTH, HEIGHT, fitOf(screen) === 'cover' && screen === phone ? 'cover' : 'contain');
     } else if (layout === 'pip' || layout === 'cameraPip') {
       // Full frame, plus a framed small box floating at the chosen spot (above the ticker)
       place(first, 0, 0, WIDTH, HEIGHT);
@@ -510,41 +693,9 @@ export class StudioMixer {
     drawFit(this.ctx, logo, logo.naturalWidth, logo.naturalHeight, 28, 24, w, h, 'contain');
   }
 
+  // Returns the height used (0 if none), so chat can sit above it
   drawLowerThird(bottom) {
-    const lt = this.state.lowerThird;
-    if (!lt?.title) return;
-    const { ctx } = this;
-    const title = lt.title.trim();
-    const subtitle = (lt.subtitle || '').trim();
-    const maxText = WIDTH - 240;
-    const titleSize = fitFont(ctx, title, 700, 36, maxText);
-    const titleW = ctx.measureText(title).width;
-    let subSize = 0;
-    let subW = 0;
-    if (subtitle) {
-      subSize = fitFont(ctx, subtitle, 400, 26, maxText);
-      subW = ctx.measureText(subtitle).width;
-    }
-    const h = subtitle ? 104 : 72;
-    const w = Math.max(titleW, subW) + 72;
-    const x = 48;
-    const y = bottom - h;
-    ctx.fillStyle = 'rgba(11, 29, 68, 0.92)';
-    roundedRect(ctx, x, y, w, h, 10);
-    ctx.fill();
-    ctx.fillStyle = RED;
-    ctx.fillRect(x, y + 14, 6, h - 28);
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#ffffff';
-    ctx.font = `700 ${titleSize}px ${FONT}`;
-    ctx.fillText(title, x + 32, subtitle ? y + 36 : y + h / 2);
-    if (subtitle) {
-      ctx.fillStyle = 'rgba(255,255,255,0.82)';
-      ctx.font = `400 ${subSize}px ${FONT}`;
-      ctx.fillText(subtitle, x + 32, y + 74);
-    }
-    ctx.textBaseline = 'alphabetic';
+    return drawLowerThird(this.ctx, this.state.lowerThird, bottom);
   }
 
   // Returns the height used, so the lower third sits above it
@@ -684,22 +835,34 @@ export class StudioMixer {
       this.drawCard(scene.text, left > 0 ? formatCountdown(left) : '0:00', scene.textColor || '#ffffff', scene.numberColor || '');
     } else if (scene.kind === 'card') {
       this.drawCard(scene.text, '', scene.textColor || '#ffffff');
+    } else if (scene.kind === 'media') {
+      // Just the background while the video loads (the playing clip takes over above)
     } else {
       this.drawLive(this.tickerHeight());
     }
 
-    if (overlay) ctx.drawImage(overlay, 0, 0, WIDTH, HEIGHT);
+    if (this.gif?.frame) {
+      this.gif.tick(performance.now());
+      ctx.drawImage(this.gif.frame, 0, 0, WIDTH, HEIGHT);
+    } else if (overlay) {
+      this.gif?.tick(performance.now());
+      ctx.drawImage(overlay, 0, 0, WIDTH, HEIGHT);
+    }
+    drawLowerThirdFrame(ctx, this.state.lowerThird);
     this.drawLogoBug();
     const tickerH = this.drawTickerBar();
-    this.drawLowerThird(HEIGHT - tickerH - 32);
-    this.drawChat(HEIGHT - tickerH - 32 - (this.state.lowerThird?.title ? (this.state.lowerThird.subtitle ? 104 : 72) + 16 : 0));
+    const lowerH = this.drawLowerThird(HEIGHT - tickerH - 32);
+    this.drawChat(HEIGHT - tickerH - 32 - (lowerH ? lowerH + 16 : 0));
     this.drawQr();
   }
 
   destroy() {
     this.stopTicker();
     this.musicEl.pause();
+    this.ambient?.destroy();
     this.clipEl.pause();
+    this.bgVideo.pause();
+    this.gif?.close();
     this.output.getTracks().forEach((t) => t.stop());
     this.audioOut.stream.getTracks().forEach((t) => t.stop());
     this.audio.close().catch(() => {});
