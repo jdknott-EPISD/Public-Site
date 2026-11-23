@@ -509,7 +509,9 @@ export class StudioMixer {
     const screenOn = hasFrame(screen);
     const threeOn = hasFrame(sharedScreen) && hasFrame(phone) && hasFrame(webcam);
     const chosen = LAYOUTS.find((l) => l.id === this.state.layout);
-    const layout = chosen?.needsThree && !threeOn ? 'side' : chosen?.needsScreen && !screenOn ? 'camera' : this.state.layout;
+    // The three-picture layout needs all three; without them, side by side if there's a second
+    // picture, otherwise just the camera (never an empty box)
+    const layout = chosen?.needsThree && !threeOn ? (screenOn ? 'side' : 'camera') : chosen?.needsScreen && !screenOn ? 'camera' : this.state.layout;
     const pad = 24;
     this.slots = []; // where each source is drawn, for drag-to-swap on the preview
 

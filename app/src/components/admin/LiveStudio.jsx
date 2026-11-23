@@ -1521,7 +1521,7 @@ const LiveStudio = () => {
               <div className="mt-4 flex flex-wrap justify-center gap-2" role="group" aria-label="Layout">
                 {LAYOUTS.filter((l) => !l.needsThree || threeAvailable).map((l) => {
                   const disabled = l.needsScreen && !screenAvailable;
-                  const current = (screenAvailable ? control.layout : 'camera') === l.id;
+                  const current = (!screenAvailable ? 'camera' : control.layout === 'trio' && !threeAvailable ? 'side' : control.layout) === l.id;
                   const label = layoutLabel(l.label);
                   return (
                     <button key={l.id} onClick={() => updateControl({ layout: l.id })} disabled={disabled}
