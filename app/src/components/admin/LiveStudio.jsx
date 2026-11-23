@@ -86,6 +86,10 @@ const SortableScene = ({ id, children }) => {
 
 // A Media scene's "next scene in the list" (Live if it's the last one)
 const NEXT_IN_LIST = 'next';
+// A countdown's next scene: '' = Live, NEXT_IN_LIST, a scene id, or STAY. Older countdowns only had
+// thenLive (true = Live, false = stay).
+const STAY = 'stay';
+const countdownThen = (scene) => scene.countdownThen ?? (scene.thenLive === false ? STAY : '');
 const sceneAfter = (scenes, scene, liveScene) => {
   if (scene.thenSceneId === NEXT_IN_LIST) {
     const i = scenes.findIndex((s) => s.id === scene.id);
@@ -202,10 +206,16 @@ const SceneForm = ({ scene, scenes, backgrounds, videos, onSave, onDelete, onClo
       {draft.kind === 'countdown' && (
         <>
           <Field label="Minutes"><input type="number" min="0.25" max="180" step="0.25" value={draft.minutes} onChange={(e) => set({ minutes: e.target.value })} className={darkInput} /></Field>
-          <label className="flex items-center gap-2 text-sm text-white/80">
-            <input type="checkbox" checked={draft.thenLive !== false} onChange={(e) => set({ thenLive: e.target.checked })} className="w-4 h-4 accent-church-blue" />
-            Switch to the Live scene when it reaches zero
-          </label>
+          <Field label="When it reaches zero, switch to">
+            <select value={countdownThen(draft)} onChange={(e) => set({ countdownThen: e.target.value, thenLive: e.target.value !== STAY })} className={darkInput}>
+              <option value="" className="text-black">The Live scene</option>
+              <option value={NEXT_IN_LIST} className="text-black">
+                The next scene in the list{draft.id ? ` (now: ${sceneAfter(scenes, { ...draft, thenSceneId: NEXT_IN_LIST }, { name: 'Live' }).name})` : ''}
+              </option>
+              {otherScenes.filter((s) => s.kind !== 'live').map((s) => <option key={s.id} value={s.id} className="text-black">{s.name}</option>)}
+              <option value={STAY} className="text-black">Stay on the countdown (shows 0:00)</option>
+            </select>
+          </Field>
         </>
       )}
       <div>
@@ -788,12 +798,16 @@ const LiveStudio = () => {
     updateControl({ ...stopClip, ...sceneChanges(s) });
   }, [mixer, updateControl, sceneChanges]);
 
-  // Countdown finished: go to the Live scene if the scene says so
+  // Countdown finished: go to the scene it names (Live unless it says otherwise)
   useEffect(() => {
-    if (scene.kind !== 'countdown' || scene.thenLive === false || !control.sceneEndsAt) return undefined;
-    const id = setTimeout(() => switchScene(liveScene), Math.max(0, control.sceneEndsAt - Date.now()) + 1000);
+    if (scene.kind !== 'countdown' || !control.sceneEndsAt) return undefined;
+    const then = countdownThen(scene);
+    if (then === STAY) return undefined;
+    const next = then ? sceneAfter(scenes, { ...scene, thenSceneId: then }, liveScene) : liveScene;
+    if (next.id === scene.id) return undefined;
+    const id = setTimeout(() => switchScene(next), Math.max(0, control.sceneEndsAt - Date.now()) + 1000);
     return () => clearTimeout(id);
-  }, [scene, control.sceneEndsAt, liveScene, switchScene]);
+  }, [scene, scenes, control.sceneEndsAt, liveScene, switchScene]);
 
   // ----- Sources (streaming computer only) -----
   const refreshDevices = useCallback(async () => {
